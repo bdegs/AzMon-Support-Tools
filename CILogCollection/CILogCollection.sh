@@ -181,15 +181,16 @@ derive_cluster_info() {
 # ─── ds_logCollection ─────────────────────────────────────────────────────────
 ds_logCollection() {
     echo -e "\nCollecting logs from DaemonSet pod: ${ds_pod}..." | tee -a Tool.log
-    kubectl describe pod "${ds_pod}" --namespace=kube-system > "describe_${ds_pod}.txt" 2>&1
-    kubectl logs "${ds_pod}" --container ama-logs --namespace=kube-system > "logs_${ds_pod}.txt" 2>&1
-    kubectl logs "${ds_pod}" --container ama-logs-prometheus --namespace=kube-system > "logs_${ds_pod}_prom.txt" 2>/dev/null
-    if kubectl logs "${ds_pod}" --container ama-logs --namespace=kube-system --previous > "logs_${ds_pod}_previous.txt" 2>/dev/null; then
+    mkdir -p ama-logs-daemonset ama-logs-prom-daemonset
+    kubectl describe pod "${ds_pod}" --namespace=kube-system > "ama-logs-daemonset/describe_${ds_pod}.txt" 2>&1
+    kubectl logs "${ds_pod}" --container ama-logs --namespace=kube-system > "ama-logs-daemonset/logs_${ds_pod}.txt" 2>&1
+    kubectl logs "${ds_pod}" --container ama-logs-prometheus --namespace=kube-system > "ama-logs-prom-daemonset/logs_${ds_pod}_prom.txt" 2>/dev/null
+    if kubectl logs "${ds_pod}" --container ama-logs --namespace=kube-system --previous > "ama-logs-daemonset/logs_${ds_pod}_previous.txt" 2>/dev/null; then
         echo -e "  ${Yellow}[WARN] Previous (pre-restart) logs collected for ${ds_pod} - this pod has restarted at least once.${NC}" | tee -a Tool.log
         echo -e "         Restarts often indicate crashes due to resource limits (OOMKill), configuration errors," | tee -a Tool.log
-        echo -e "         or a failing dependency. Review logs_${ds_pod}_previous.txt to see what caused the restart.${NC}" | tee -a Tool.log
+        echo -e "         or a failing dependency. Review ama-logs-daemonset/logs_${ds_pod}_previous.txt to see what caused the restart.${NC}" | tee -a Tool.log
     fi
-    kubectl exec "${ds_pod}" -n kube-system -c ama-logs --request-timeout=10m -- ps -ef > "process_${ds_pod}.txt" 2>/dev/null
+    kubectl exec "${ds_pod}" -n kube-system -c ama-logs --request-timeout=10m -- ps -ef > "ama-logs-daemonset/process_${ds_pod}.txt" 2>/dev/null
 
     local check
     check=$(kubectl exec "${ds_pod}" -n kube-system -c ama-logs -- ls /var/opt/microsoft 2>&1)
@@ -215,6 +216,9 @@ ds_logCollection() {
         kubectl cp "${ds_pod}:/var/opt/microsoft/linuxmonagent/log"     ama-logs-daemonset-mdsd     --namespace=kube-system --container ama-logs > /dev/null 2>&1
         kubectl cp "${ds_pod}:/var/opt/microsoft/linuxmonagent/log"     ama-logs-prom-daemonset-mdsd --namespace=kube-system --container ama-logs-prometheus > /dev/null 2>&1
         kubectl cp "${ds_pod}:/etc/mdsd.d/config-cache/configchunks/"  ama-logs-daemonset-dcr      --namespace=kube-system --container ama-logs > /dev/null 2>&1
+        echo -e "    /etc/mdsd.d/"
+        echo -e "      mdsd config directory - mdsd.xml defines sources, sinks, and the output pipeline"
+        kubectl cp "${ds_pod}:/etc/mdsd.d/" ama-logs-daemonset-mdsd-config --namespace=kube-system --container ama-logs > /dev/null 2>&1
 
         # A missing or empty configchunks dir means the agent has not received its DCR config.
         local chunk_count
@@ -235,7 +239,7 @@ ds_logCollection() {
     fi
 
     kubectl exec "${ds_pod}" --namespace=kube-system -c ama-logs -- \
-        ls /var/opt/microsoft/docker-cimprov/state/ContainerInventory > "containerID_${ds_pod}.txt" 2>&1
+        ls /var/opt/microsoft/docker-cimprov/state/ContainerInventory > "ama-logs-daemonset/containerID_${ds_pod}.txt" 2>&1
 
     check=$(kubectl exec "${ds_pod}" -n kube-system -c ama-logs -- ls /etc/fluent 2>&1)
     if [[ $check != *"cannot access"* ]] && [[ $check != *"No such file"* ]]; then
@@ -254,15 +258,23 @@ ds_logCollection() {
         kubectl cp "${ds_pod}:/etc/opt/microsoft/docker-cimprov/telegraf.conf"   ama-logs-prom-daemonset/telegraf.conf    --namespace=kube-system --container ama-logs-prometheus > /dev/null 2>&1
     fi
 
+    check=$(kubectl exec "${ds_pod}" -n kube-system -c ama-logs -- ls /etc/config/settings 2>&1)
+    if [[ $check != *"cannot access"* ]] && [[ $check != *"No such file"* ]]; then
+        echo -e "    /etc/config/settings"
+        echo -e "      custom prometheus/metrics settings applied from ConfigMap"
+        kubectl cp "${ds_pod}:/etc/config/settings/" ama-logs-daemonset/settings --namespace=kube-system --container ama-logs > /dev/null 2>&1
+    fi
+
     echo -e "Complete log collection from ${ds_pod}!" | tee -a Tool.log
 }
 
 # ─── win_logCollection ────────────────────────────────────────────────────────
 win_logCollection() {
     echo -e "\nCollecting logs from Windows pod: ${ds_win_pod} (this may take several minutes)..." | tee -a Tool.log
-    kubectl describe pod "${ds_win_pod}" --namespace=kube-system > "describe_${ds_win_pod}.txt" 2>&1
-    kubectl logs "${ds_win_pod}" --container ama-logs-windows --namespace=kube-system > "logs_${ds_win_pod}.txt" 2>&1
-    kubectl exec "${ds_win_pod}" -n kube-system --request-timeout=10m -- powershell Get-Process > "process_${ds_win_pod}.txt" 2>/dev/null
+    mkdir -p ama-logs-windows-daemonset
+    kubectl describe pod "${ds_win_pod}" --namespace=kube-system > "ama-logs-windows-daemonset/describe_${ds_win_pod}.txt" 2>&1
+    kubectl logs "${ds_win_pod}" --container ama-logs-windows --namespace=kube-system > "ama-logs-windows-daemonset/logs_${ds_win_pod}.txt" 2>&1
+    kubectl exec "${ds_win_pod}" -n kube-system --request-timeout=10m -- powershell Get-Process > "ama-logs-windows-daemonset/process_${ds_win_pod}.txt" 2>/dev/null
 
     local check
     check=$(kubectl exec "${ds_win_pod}" -n kube-system -- powershell ls /etc 2>&1)
@@ -277,7 +289,6 @@ win_logCollection() {
     kubectl cp "${ds_win_pod}:/etc/fluent-bit" ama-logs-windows-daemonset-fbit --namespace=kube-system > /dev/null 2>&1
     kubectl cp "${ds_win_pod}:/etc/telegraf/telegraf.conf" ama-logs-windows-daemonset-fbit/telegraf.conf --namespace=kube-system > /dev/null 2>&1
 
-    mkdir -p ama-logs-windows-daemonset
     local win_logs=(
         kubernetes_perf_log.txt
         appinsights_error.log
@@ -298,14 +309,15 @@ win_logCollection() {
 # ─── rs_logCollection ─────────────────────────────────────────────────────────
 rs_logCollection() {
     echo -e "\nCollecting logs from ReplicaSet pod: ${rs_pod}..." | tee -a Tool.log
-    kubectl describe pod "${rs_pod}" --namespace=kube-system > "describe_${rs_pod}.txt" 2>&1
-    kubectl logs "${rs_pod}" --container ama-logs --namespace=kube-system > "logs_${rs_pod}.txt" 2>&1
-    if kubectl logs "${rs_pod}" --container ama-logs --namespace=kube-system --previous > "logs_${rs_pod}_previous.txt" 2>/dev/null; then
+    mkdir -p ama-logs-replicaset
+    kubectl describe pod "${rs_pod}" --namespace=kube-system > "ama-logs-replicaset/describe_${rs_pod}.txt" 2>&1
+    kubectl logs "${rs_pod}" --container ama-logs --namespace=kube-system > "ama-logs-replicaset/logs_${rs_pod}.txt" 2>&1
+    if kubectl logs "${rs_pod}" --container ama-logs --namespace=kube-system --previous > "ama-logs-replicaset/logs_${rs_pod}_previous.txt" 2>/dev/null; then
         echo -e "  ${Yellow}[WARN] Previous (pre-restart) logs collected for ${rs_pod} - this pod has restarted at least once.${NC}" | tee -a Tool.log
         echo -e "         Restarts often indicate crashes due to resource limits (OOMKill), configuration errors," | tee -a Tool.log
-        echo -e "         or a failing dependency. Review logs_${rs_pod}_previous.txt to see what caused the restart.${NC}" | tee -a Tool.log
+        echo -e "         or a failing dependency. Review ama-logs-replicaset/logs_${rs_pod}_previous.txt to see what caused the restart.${NC}" | tee -a Tool.log
     fi
-    kubectl exec "${rs_pod}" -n kube-system -c ama-logs --request-timeout=10m -- ps -ef > "process_${rs_pod}.txt" 2>/dev/null
+    kubectl exec "${rs_pod}" -n kube-system -c ama-logs --request-timeout=10m -- ps -ef > "ama-logs-replicaset/process_${rs_pod}.txt" 2>/dev/null
 
     local check
     check=$(kubectl exec "${rs_pod}" -n kube-system -c ama-logs -- ls /var/opt/microsoft 2>&1)
@@ -324,6 +336,8 @@ rs_logCollection() {
         kubectl cp "${rs_pod}:/var/opt/microsoft/docker-cimprov/log"   ama-logs-replicaset      --namespace=kube-system > /dev/null 2>&1
         kubectl cp "${rs_pod}:/var/opt/microsoft/linuxmonagent/log"    ama-logs-replicaset-mdsd --namespace=kube-system > /dev/null 2>&1
         kubectl cp "${rs_pod}:/etc/mdsd.d/config-cache/configchunks/" ama-logs-replicaset-dcr  --namespace=kube-system --container ama-logs > /dev/null 2>&1
+        echo -e "    /etc/mdsd.d/"
+        kubectl cp "${rs_pod}:/etc/mdsd.d/" ama-logs-replicaset-mdsd-config --namespace=kube-system --container ama-logs > /dev/null 2>&1
 
         local chunk_count
         chunk_count=$(kubectl exec "${rs_pod}" -n kube-system -c ama-logs \
@@ -359,6 +373,7 @@ rs_logCollection() {
 # ─── other_logCollection ──────────────────────────────────────────────────────
 other_logCollection() {
     echo -e "\nCollecting cluster metadata..." | tee -a Tool.log
+    mkdir -p cluster
 
     local deploy
     deploy=$(kubectl get deployment --namespace=kube-system | grep -E ama-logs | head -n 1 | awk '{print $1}')
@@ -368,7 +383,7 @@ other_logCollection() {
         ANALYSIS_FINDINGS+=("No ama-logs deployment found. Container Insights addon may not be enabled or may have been removed from the cluster.")
     else
         echo -e "  Collecting deployment info for: ${deploy}"
-        kubectl get deployment "$deploy" --namespace=kube-system -o yaml > "deployment_${deploy}.yaml"
+        kubectl get deployment "$deploy" --namespace=kube-system -o yaml > "cluster/deployment_${deploy}.yaml"
     fi
 
     # All relevant ConfigMaps - missing ones are informational only (cluster may use defaults)
@@ -384,16 +399,18 @@ other_logCollection() {
             echo -e "  ${Cyan}[INFO] ConfigMap '${pattern}' not found - cluster likely using defaults.${NC}"
         else
             echo -e "  Collecting configmap: ${cm_name} (${cms[$pattern]})"
-            kubectl get configmaps "$cm_name" --namespace=kube-system -o yaml > "${cm_name}.yaml"
+            kubectl get configmaps "$cm_name" --namespace=kube-system -o yaml > "cluster/${cm_name}.yaml"
         fi
     done
 
     # Node info + quick status snapshots for the archive
-    kubectl get nodes > node.txt 2>&1
-    kubectl get nodes -o json > node-detailed.json 2>&1
-    kubectl get daemonset -n kube-system | grep ama-logs > daemonset-status.txt 2>&1
-    kubectl get pods -n kube-system | grep ama-logs > pod-status.txt 2>&1
-    kubectl get events -n kube-system --sort-by='.lastTimestamp' 2>/dev/null | grep -i ama-logs > ama-logs-events.txt 2>&1
+    kubectl get nodes > cluster/node.txt 2>&1
+    kubectl get nodes -o json > cluster/node-detailed.json 2>&1
+    kubectl get daemonset -n kube-system | grep ama-logs > cluster/daemonset-status.txt 2>&1
+    kubectl get pods -n kube-system | grep ama-logs > cluster/pod-status.txt 2>&1
+    kubectl get events -n kube-system --sort-by='.lastTimestamp' 2>/dev/null | grep -i ama-logs > cluster/ama-logs-events.txt 2>&1
+    kubectl get networkpolicy -n kube-system -o yaml > cluster/network-policies.yaml 2>&1
+    kubectl get serviceaccount ama-logs -n kube-system -o yaml > cluster/serviceaccount-ama-logs.yaml 2>&1
 
     # Agent image version
     local agent_image=""
@@ -403,14 +420,14 @@ other_logCollection() {
     fi
     if [[ -n "$agent_image" ]]; then
         echo -e "  ${Cyan}[INFO] ama-logs image: ${agent_image}${NC}" | tee -a Tool.log
-        echo "ama-logs image: ${agent_image}" > agent-version.txt
+        echo "ama-logs image: ${agent_image}" > cluster/agent-version.txt
     fi
 
     # Resource usage snapshot (requires metrics-server)
-    kubectl top nodes > top-nodes.txt 2>&1 \
-        || echo "(kubectl top not available - metrics-server may not be installed)" > top-nodes.txt
-    kubectl top pods -n kube-system > top-pods-kube-system.txt 2>&1 \
-        || echo "(kubectl top not available)" > top-pods-kube-system.txt
+    kubectl top nodes > cluster/top-nodes.txt 2>&1 \
+        || echo "(kubectl top not available - metrics-server may not be installed)" > cluster/top-nodes.txt
+    kubectl top pods -n kube-system > cluster/top-pods-kube-system.txt 2>&1 \
+        || echo "(kubectl top not available)" > cluster/top-pods-kube-system.txt
 
     local node_os
     node_os=$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.osImage}' 2>/dev/null)
@@ -747,7 +764,7 @@ analyze_collected_logs() {
     fi
 
     # ── OOMKill / restart count ───────────────────────────────────────────────
-    for desc in describe_*.txt; do
+    for desc in ama-logs-daemonset/describe_*.txt ama-logs-replicaset/describe_*.txt ama-logs-windows-daemonset/describe_*.txt; do
         [[ ! -f "$desc" ]] && continue
         echo -e "\nAnalyzing ${desc} for restarts and OOMKill..." | tee -a "$analysis_log"
 
@@ -778,7 +795,7 @@ analyze_collected_logs() {
     done
 
     # ── container-azm-ms-agentconfig ConfigMap ────────────────────────────────
-    local cm_file="container-azm-ms-agentconfig.yaml"
+    local cm_file="cluster/container-azm-ms-agentconfig.yaml"
     if [[ -f "$cm_file" ]]; then
         echo -e "\nAnalyzing ${cm_file}..." | tee -a "$analysis_log"
         local cm_issues=0
@@ -1158,9 +1175,9 @@ azure_config_check() {
 
     local addon_enabled use_aad_auth
     addon_enabled=$(az aks show --resource-group "$cluster_rg" --name "$cluster_name" \
-        --query "addonProfiles.omsagent.enabled" -o tsv 2>/dev/null)
+        --query "addonProfiles.omsAgent.enabled" -o tsv 2>/dev/null)
     use_aad_auth=$(az aks show --resource-group "$cluster_rg" --name "$cluster_name" \
-        --query "addonProfiles.omsagent.config.useAADAuth" -o tsv 2>/dev/null)
+        --query "addonProfiles.omsAgent.config.useAADAuth" -o tsv 2>/dev/null)
 
     if [[ "$addon_enabled" != "true" ]]; then
         echo -e "  ${Red}[ERROR] Container Insights monitoring addon is not enabled on this cluster.${NC}" | tee -a "$az_log"
