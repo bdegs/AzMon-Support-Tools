@@ -477,7 +477,6 @@ network_connectivity_check() {
     # Static endpoints - always required
     endpoints+=(
         "dc.services.visualstudio.com"
-        "login.microsoftonline.com"
         "global.handler.control.monitor.azure.com"
     )
 
@@ -508,7 +507,6 @@ network_connectivity_check() {
 
     echo -e "\nTesting connectivity to Azure Monitor endpoints from inside the agent pod." | tee -a "$net_log"
     echo -e "These endpoints must be reachable for the agent to ingest data:" | tee -a "$net_log"
-    echo -e "  - login.microsoftonline.com        : Azure AD token acquisition (MSI authentication)" | tee -a "$net_log"
     echo -e "  - *.handler.control.monitor.azure.com : DCR / configuration delivery" | tee -a "$net_log"
     echo -e "  - *.ods.opinsights.azure.com        : Log data ingestion endpoint" | tee -a "$net_log"
     echo -e "  - *.oms.opinsights.azure.com        : Agent heartbeat and management" | tee -a "$net_log"
@@ -547,7 +545,6 @@ network_connectivity_check() {
         done
     else
         echo -e "  ${Yellow}[SKIP] nslookup not found in the agent pod - DNS resolution tests skipped.${NC}" | tee -a "$net_log"
-        echo -e "         To test manually: kubectl exec -it ${test_pod} -n kube-system -c ama-logs -- nslookup login.microsoftonline.com" | tee -a "$net_log"
     fi
 
     # ── HTTPS connectivity tests ──────────────────────────────────────────────
@@ -577,7 +574,6 @@ network_connectivity_check() {
         done
     else
         echo -e "  ${Yellow}[SKIP] curl not found in the agent pod - HTTPS connectivity tests skipped.${NC}" | tee -a "$net_log"
-        echo -e "         To test manually: kubectl exec -it ${test_pod} -n kube-system -c ama-logs -- curl -v --max-time 10 https://login.microsoftonline.com" | tee -a "$net_log"
     fi
 
     # ── SSL inspection hint ───────────────────────────────────────────────────
@@ -1103,6 +1099,109 @@ except Exception as e:
     fi
 }
 
+# ─── _check_workspace_network_isolation ──────────────────────────────────────
+# Checks publicNetworkAccessForIngestion on the workspace and, when AMPLS is
+# detected, verifies the workspace is a connected resource in a private link scope.
+_check_workspace_network_isolation() {
+    local az_log="$1"
+
+    echo -e "\n${Bold}Log Analytics Workspace Network Isolation:${NC}" | tee -a "$az_log"
+    echo -e "Verifies whether the workspace accepts public ingestion, and if AMPLS is in use," | tee -a "$az_log"
+    echo -e "whether the workspace is linked as a connected resource in the private link scope." | tee -a "$az_log"
+
+    if [[ -z "$WORKSPACE_ID" ]]; then
+        echo -e "  ${Yellow}[SKIP] Workspace ID not available - pass --workspace-id or --cluster-resource-id to enable this check.${NC}" | tee -a "$az_log"
+        return
+    fi
+
+    local ws_json
+    ws_json=$(az monitor log-analytics workspace list \
+        --query "[?customerId=='${WORKSPACE_ID}'] | [0]" -o json 2>/dev/null)
+
+    if [[ -z "$ws_json" ]] || [[ "$ws_json" == "null" ]]; then
+        echo -e "  ${Yellow}[WARN] Could not locate workspace with ID ${WORKSPACE_ID} in the current subscription." | tee -a "$az_log"
+        echo -e "         The workspace may be in a different subscription. Skipping this check.${NC}" | tee -a "$az_log"
+        return
+    fi
+
+    local ws_name ws_rg ws_resource_id public_ingestion
+    ws_name=$(echo "$ws_json"          | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('name',''))" 2>/dev/null)
+    ws_rg=$(echo "$ws_json"            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('resourceGroup',''))" 2>/dev/null)
+    ws_resource_id=$(echo "$ws_json"   | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id',''))" 2>/dev/null)
+    public_ingestion=$(echo "$ws_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('publicNetworkAccessForIngestion',''))" 2>/dev/null)
+
+    if [[ -z "$public_ingestion" ]]; then
+        echo -e "  ${Yellow}[WARN] Could not read publicNetworkAccessForIngestion from workspace response.${NC}" | tee -a "$az_log"
+        return
+    fi
+
+    echo -e "  Workspace: ${ws_name} (resource group: ${ws_rg})" | tee -a "$az_log"
+
+    if [[ "$public_ingestion" == "Disabled" ]]; then
+        if ! $USE_AMPLS; then
+            echo -e "  ${Red}[ISSUE] Workspace '${ws_name}' requires private network ingestion" | tee -a "$az_log"
+            echo -e "          (publicNetworkAccessForIngestion = Disabled) but the cluster does not appear to be" | tee -a "$az_log"
+            echo -e "          using AMPLS. Data sent over public endpoints will be rejected by the workspace.${NC}" | tee -a "$az_log"
+            echo -e "          -> Either enable public network access on the workspace, or configure an Azure" | tee -a "$az_log"
+            echo -e "             Monitor Private Link Scope (AMPLS) and connect this cluster's private endpoint to it." | tee -a "$az_log"
+            ANALYSIS_FINDINGS+=("Workspace ${ws_name}: publicNetworkAccessForIngestion=Disabled but cluster is not using AMPLS. Ingestion over public endpoints will be rejected.")
+        else
+            echo -e "  ${Green}[OK] Workspace requires private network ingestion and cluster is using AMPLS — consistent configuration.${NC}" | tee -a "$az_log"
+        fi
+    else
+        echo -e "  ${Green}[OK] Workspace accepts ingestion from public networks (publicNetworkAccessForIngestion = ${public_ingestion}).${NC}" | tee -a "$az_log"
+    fi
+
+    # When AMPLS is in use, verify the workspace is a connected resource in a scope
+    if $USE_AMPLS; then
+        echo -e "\n  Checking whether workspace is a connected resource in an AMPLS scope..." | tee -a "$az_log"
+
+        local scopes_json
+        scopes_json=$(az monitor private-link-scope list -o json 2>/dev/null)
+
+        if [[ -z "$scopes_json" ]] || [[ "$scopes_json" == "[]" ]]; then
+            echo -e "  ${Yellow}[WARN] No Azure Monitor Private Link Scopes found in this subscription." | tee -a "$az_log"
+            echo -e "         AMPLS is detected but no scopes exist here — the scope may be in a different subscription.${NC}" | tee -a "$az_log"
+            return
+        fi
+
+        local scope_count found_in_scope=false scope_name_found=""
+        scope_count=$(echo "$scopes_json" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null)
+        echo -e "  Found ${scope_count} AMPLS scope(s) in this subscription." | tee -a "$az_log"
+
+        while IFS='|' read -r scope_name scope_rg; do
+            local scoped_resources
+            scoped_resources=$(az monitor private-link-scope scoped-resource list \
+                --scope-name "$scope_name" --resource-group "$scope_rg" -o json 2>/dev/null)
+            if WS_RESOURCE_ID="$ws_resource_id" python3 -c "
+import sys, json, os
+ws_id = os.environ.get('WS_RESOURCE_ID','').lower()
+found = any(r.get('linkedResourceId','').lower() == ws_id for r in json.load(sys.stdin))
+sys.exit(0 if found else 1)
+" <<< "$scoped_resources" 2>/dev/null; then
+                found_in_scope=true
+                scope_name_found="$scope_name"
+                break
+            fi
+        done < <(echo "$scopes_json" | python3 -c "
+import sys, json
+for s in json.load(sys.stdin):
+    print(s['name'] + '|' + s['resourceGroup'])
+" 2>/dev/null)
+
+        if $found_in_scope; then
+            echo -e "  ${Green}[OK] Workspace '${ws_name}' is a connected resource in AMPLS scope '${scope_name_found}'.${NC}" | tee -a "$az_log"
+            echo -e "       Data from this cluster can reach the workspace through the private link." | tee -a "$az_log"
+        else
+            echo -e "  ${Red}[ISSUE] Workspace '${ws_name}' is NOT a connected resource in any AMPLS scope in this subscription.${NC}" | tee -a "$az_log"
+            echo -e "          The cluster routes through AMPLS but the workspace is not linked to the scope." | tee -a "$az_log"
+            echo -e "          Data will be dropped when it reaches the private link endpoint.${NC}" | tee -a "$az_log"
+            echo -e "          -> Add '${ws_name}' as a scoped resource in the AMPLS scope covering this cluster." | tee -a "$az_log"
+            ANALYSIS_FINDINGS+=("AMPLS: Workspace '${ws_name}' is not a connected resource in any AMPLS scope in this subscription. Ingestion through the private link will fail.")
+        fi
+    fi
+}
+
 # ─── _ensure_az_extension ────────────────────────────────────────────────────
 # Checks if an Azure CLI extension is installed; installs it if not.
 # Returns 0 on success, 1 if installation failed.
@@ -1206,9 +1305,11 @@ azure_config_check() {
     if $ext_loganalytics; then
         _check_daily_cap "$az_log"
         _check_workspace_tables "$az_log" "$use_aad_auth"
+        _check_workspace_network_isolation "$az_log"
     else
         echo -e "\n${Yellow}[SKIP] Daily cap check skipped - log-analytics extension could not be installed.${NC}" | tee -a "$az_log"
         echo -e "${Yellow}[SKIP] Table activity check skipped - log-analytics extension could not be installed.${NC}" | tee -a "$az_log"
+        echo -e "${Yellow}[SKIP] Workspace network isolation check skipped - log-analytics extension could not be installed.${NC}" | tee -a "$az_log"
     fi
 
     echo -e "\nAzure configuration check complete. Results saved to ${az_log}" | tee -a Tool.log
