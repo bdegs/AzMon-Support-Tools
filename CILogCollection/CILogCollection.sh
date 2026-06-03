@@ -18,6 +18,7 @@ WORKSPACE_ID=""
 CLUSTER_REGION=""
 CLUSTER_RESOURCE_ID=""
 USE_AMPLS=false
+DETECTED_DCE_ID=""
 SKIP_NETWORK=false
 SKIP_ANALYSIS=false
 ANALYSIS_FINDINGS=()
@@ -172,7 +173,7 @@ derive_cluster_info() {
                echo "$resolved_ip" | grep -qE "^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)"; then
                 USE_AMPLS=true
                 echo -e "${Cyan}[INFO] AMPLS auto-detected: ${ods_host} resolved to private IP (${resolved_ip})." | tee -a Tool.log
-                echo -e "       Network tests will use privatelink endpoints.${NC}" | tee -a Tool.log
+                echo -e "       ODS/OMS endpoints will resolve to private IPs via DNS override.${NC}" | tee -a Tool.log
             fi
         fi
     fi
@@ -480,8 +481,10 @@ network_connectivity_check() {
         "global.handler.control.monitor.azure.com"
     )
 
-    # Region-specific endpoints (managed identity / DCR fetch)
-    if [[ -n "$CLUSTER_REGION" ]]; then
+    # Region-specific endpoints - only tested in non-AMPLS mode.
+    # AMPLS creates a private DNS zone for global.handler.control.monitor.azure.com but not
+    # the regional endpoint, so it will always resolve to a public IP in AMPLS mode.
+    if [[ -n "$CLUSTER_REGION" ]] && ! $USE_AMPLS; then
         endpoints+=(
             "${CLUSTER_REGION}.handler.control.monitor.azure.com"
         )
@@ -489,17 +492,13 @@ network_connectivity_check() {
 
     # Workspace-specific ODS/OMS endpoints
     if [[ -n "$WORKSPACE_ID" ]]; then
-        if $USE_AMPLS; then
-            endpoints+=(
-                "${WORKSPACE_ID}.privatelink.ods.opinsights.azure.com"
-                "${WORKSPACE_ID}.privatelink.oms.opinsights.azure.com"
-            )
-        else
-            endpoints+=(
-                "${WORKSPACE_ID}.ods.opinsights.azure.com"
-                "${WORKSPACE_ID}.oms.opinsights.azure.com"
-            )
-        fi
+        # Always use the non-privatelink hostnames. In AMPLS mode, the private DNS zone overrides
+        # resolution of these hostnames to private IPs — the DNS test below validates that.
+        # The .privatelink. form causes TLS failures (cert is for *.ods.opinsights.azure.com).
+        endpoints+=(
+            "${WORKSPACE_ID}.ods.opinsights.azure.com"
+            "${WORKSPACE_ID}.oms.opinsights.azure.com"
+        )
     fi
 
     local net_failures=0
@@ -615,6 +614,7 @@ analyze_collected_logs() {
     echo -e "Scanning the collected log files for known error patterns." | tee -a Tool.log
     echo -e "Each log file covers a specific part of the data collection pipeline:" | tee -a Tool.log
     echo -e "  mdsd.err       : errors from the core agent engine (auth, network, TLS)" | tee -a Tool.log
+    echo -e "  mdsd.warn      : warnings from the core agent engine (transient or recoverable issues)" | tee -a Tool.log
     echo -e "  mdsd.qos       : per-table throughput — confirms data is actually being sent" | tee -a Tool.log
     echo -e "  fluent-bit     : container log reader — collects logs from /var/log/containers/" | tee -a Tool.log
     echo -e "  fluentd        : pipeline router — forwards data through the processing chain" | tee -a Tool.log
@@ -682,6 +682,38 @@ analyze_collected_logs() {
             found_any=true
         else
             echo -e "  ${Green}[OK] No critical errors in mdsd — the agent's core engine is operating normally.${NC}" | tee -a "$analysis_log"
+        fi
+    done
+
+    # ── mdsd.warn ────────────────────────────────────────────────────────────
+    for mdsd_warn in ama-logs-daemonset-mdsd/mdsd.warn ama-logs-replicaset-mdsd/mdsd.warn; do
+        [[ ! -f "$mdsd_warn" ]] && continue
+        echo -e "\nChecking ${mdsd_warn} for unexpected warnings..." | tee -a "$analysis_log"
+
+        # The systemctl-not-found message is always expected in a container (no init system).
+        # Filter it out so it doesn't obscure real warnings.
+        local warn_filtered
+        warn_filtered=$(grep -viE "CheckIfHimdsServiceInstalled|systemctl executable was not found" "$mdsd_warn" 2>/dev/null)
+
+        if [[ -z "$warn_filtered" ]]; then
+            echo -e "  ${Green}[OK] No unexpected warnings in mdsd.warn.${NC}" | tee -a "$analysis_log"
+        else
+            local warn_tmp
+            warn_tmp=$(mktemp)
+            echo "$warn_filtered" > "$warn_tmp"
+
+            if scan_log "$warn_tmp" "$mdsd_warn" \
+                "retry|failed|timeout|certificate|SSL|TLS|x509|auth|unauthorized|forbidden|connection" \
+                "Unexpected warnings detected in mdsd.warn." \
+                "Review the warnings above — they may indicate intermittent connectivity, auth, or TLS issues." \
+                1; then
+                found_any=true
+            else
+                local remaining
+                remaining=$(wc -l < "$warn_tmp")
+                echo -e "  ${Cyan}[INFO] ${mdsd_warn}: ${remaining} warning(s) present but no known error patterns matched — review manually if issues persist.${NC}" | tee -a "$analysis_log"
+            fi
+            rm -f "$warn_tmp"
         fi
     done
 
@@ -920,11 +952,12 @@ print('|'.join([
     sets.get('interval','not set'),
     sets.get('namespaceFilteringMode','not set'),
     str(sets.get('enableContainerLogV2','not set')),
+    d.get('dataCollectionEndpointId',''),
 ]))
 " 2>/dev/null)
 
-        local dcr_name ws_id ws_resource_id streams interval ns_filter clv2
-        IFS='|' read -r dcr_name ws_id ws_resource_id streams interval ns_filter clv2 <<< "$fields"
+        local dcr_name ws_id ws_resource_id streams interval ns_filter clv2 dce_id
+        IFS='|' read -r dcr_name ws_id ws_resource_id streams interval ns_filter clv2 dce_id <<< "$fields"
 
         echo -e "  ${Green}[OK] Container Insights DCR found: ${dcr_name}${NC}" | tee -a "$az_log"
         echo -e "  Destination workspace:     ${ws_id:-not found}"    | tee -a "$az_log"
@@ -937,6 +970,14 @@ print('|'.join([
             echo -e "  ContainerLogV2 enabled:    no (container logs stored in ContainerLog table — legacy format)"  | tee -a "$az_log"
         else
             echo -e "  ContainerLogV2 enabled:    ${clv2}"             | tee -a "$az_log"
+        fi
+        if [[ -n "$dce_id" ]]; then
+            local dce_name
+            dce_name=$(az monitor data-collection endpoint show --ids "$dce_id" --query "name" -o tsv 2>/dev/null)
+            echo -e "  Data Collection Endpoint:  ${dce_name:-$dce_id}" | tee -a "$az_log"
+            DETECTED_DCE_ID="$dce_id"
+        else
+            echo -e "  Data Collection Endpoint:  (none — agent uses default regional endpoint)" | tee -a "$az_log"
         fi
 
         # Populate global WORKSPACE_ID from DCR if not already known
@@ -1202,6 +1243,93 @@ for s in json.load(sys.stdin):
     fi
 }
 
+# ─── _check_dce_ampls ────────────────────────────────────────────────────────
+# In AMPLS mode, verifies that a Data Collection Endpoint (DCE) is configured
+# and is a connected resource in the AMPLS scope. The DCE is the endpoint the
+# agent uses to fetch its DCR configuration; if it is not in the scope, config
+# delivery fails over the private link (typically manifests as 403 errors in mdsd).
+_check_dce_ampls() {
+    local az_log="$1"
+
+    echo -e "\n${Bold}Data Collection Endpoint (DCE) AMPLS Check:${NC}" | tee -a "$az_log"
+    echo -e "In AMPLS mode, the DCE used for configuration delivery must be a connected resource" | tee -a "$az_log"
+    echo -e "in the AMPLS scope, and must have an association with the cluster resource." | tee -a "$az_log"
+
+    # ── Step 1: Find the DCE ID ───────────────────────────────────────────────
+    # Prefer the DCE embedded in the DCR (set by _check_dcr_dcra); fall back to
+    # a direct DataCollectionEndpointAssociation on the cluster resource.
+    local dce_id="$DETECTED_DCE_ID" dce_source="DCR"
+
+    if [[ -z "$dce_id" ]]; then
+        local dcra_json
+        dcra_json=$(az monitor data-collection rule association list \
+            --resource "$CLUSTER_RESOURCE_ID" -o json 2>/dev/null)
+        dce_id=$(echo "$dcra_json" | python3 -c "
+import sys, json
+for a in json.load(sys.stdin):
+    ep = a.get('dataCollectionEndpointId','')
+    if ep:
+        print(ep)
+        break
+" 2>/dev/null)
+        dce_source="direct cluster association"
+    fi
+
+    if [[ -z "$dce_id" ]]; then
+        echo -e "  ${Red}[ISSUE] No Data Collection Endpoint found in the DCR or as a direct cluster association.${NC}" | tee -a "$az_log"
+        echo -e "          In AMPLS mode, a DCE must be explicitly configured so the agent can reach" | tee -a "$az_log"
+        echo -e "          configuration endpoints over the private link." | tee -a "$az_log"
+        echo -e "          -> Assign a DCE to the Container Insights DCR (dataCollectionEndpointId)" | tee -a "$az_log"
+        echo -e "             and add it as a scoped resource in the AMPLS scope." | tee -a "$az_log"
+        ANALYSIS_FINDINGS+=("AMPLS: No Data Collection Endpoint found in the DCR or cluster associations. A DCE must be configured and added to the AMPLS scope for config delivery over private link.")
+        return
+    fi
+
+    local dce_name
+    dce_name=$(az monitor data-collection endpoint show --ids "$dce_id" --query "name" -o tsv 2>/dev/null)
+    echo -e "  DCE found (via ${dce_source}): ${dce_name:-$dce_id}" | tee -a "$az_log"
+
+    # ── Step 2: Verify the DCE is in an AMPLS scope ───────────────────────────
+    local scopes_json
+    scopes_json=$(az monitor private-link-scope list -o json 2>/dev/null)
+
+    if [[ -z "$scopes_json" ]] || [[ "$scopes_json" == "[]" ]]; then
+        echo -e "  ${Yellow}[WARN] No AMPLS scopes found in this subscription — cannot verify DCE scope membership.${NC}" | tee -a "$az_log"
+        return
+    fi
+
+    local found_in_scope=false scope_name_found=""
+    while IFS='|' read -r scope_name scope_rg; do
+        local scoped_resources
+        scoped_resources=$(az monitor private-link-scope scoped-resource list \
+            --scope-name "$scope_name" --resource-group "$scope_rg" -o json 2>/dev/null)
+        if DCE_ID="$dce_id" python3 -c "
+import sys, json, os
+dce = os.environ.get('DCE_ID','').lower()
+found = any(r.get('linkedResourceId','').lower() == dce for r in json.load(sys.stdin))
+sys.exit(0 if found else 1)
+" <<< "$scoped_resources" 2>/dev/null; then
+            found_in_scope=true
+            scope_name_found="$scope_name"
+            break
+        fi
+    done < <(echo "$scopes_json" | python3 -c "
+import sys, json
+for s in json.load(sys.stdin):
+    print(s['name'] + '|' + s['resourceGroup'])
+" 2>/dev/null)
+
+    if $found_in_scope; then
+        echo -e "  ${Green}[OK] DCE '${dce_name:-$dce_id}' is a connected resource in AMPLS scope '${scope_name_found}'.${NC}" | tee -a "$az_log"
+        echo -e "       The agent can reach configuration endpoints over the private link." | tee -a "$az_log"
+    else
+        echo -e "  ${Red}[ISSUE] DCE '${dce_name:-$dce_id}' is NOT a connected resource in any AMPLS scope in this subscription.${NC}" | tee -a "$az_log"
+        echo -e "          The agent cannot fetch its DCR configuration over the private link." | tee -a "$az_log"
+        echo -e "          -> Add '${dce_name:-$dce_id}' as a scoped resource in the AMPLS scope covering this cluster.${NC}" | tee -a "$az_log"
+        ANALYSIS_FINDINGS+=("AMPLS: DCE '${dce_name:-$dce_id}' is not a connected resource in any AMPLS scope. Add it as a scoped resource so the agent can fetch configuration over the private link.")
+    fi
+}
+
 # ─── _ensure_az_extension ────────────────────────────────────────────────────
 # Checks if an Azure CLI extension is installed; installs it if not.
 # Returns 0 on success, 1 if installation failed.
@@ -1312,6 +1440,12 @@ azure_config_check() {
         echo -e "${Yellow}[SKIP] Workspace network isolation check skipped - log-analytics extension could not be installed.${NC}" | tee -a "$az_log"
     fi
 
+    if $USE_AMPLS && $ext_monitor; then
+        _check_dce_ampls "$az_log"
+    elif $USE_AMPLS; then
+        echo -e "\n${Yellow}[SKIP] DCE AMPLS check skipped - monitor-control-service extension could not be installed.${NC}" | tee -a "$az_log"
+    fi
+
     echo -e "\nAzure configuration check complete. Results saved to ${az_log}" | tee -a Tool.log
 }
 
@@ -1385,13 +1519,13 @@ fi
 
 other_logCollection
 
+derive_cluster_info
+
 if [[ -n "$CLUSTER_RESOURCE_ID" ]]; then
     azure_config_check
 else
     echo -e "${Cyan}[INFO] Azure configuration checks skipped. Pass --cluster-resource-id to enable.${NC}" | tee -a Tool.log
 fi
-
-derive_cluster_info
 
 if ! $SKIP_NETWORK; then
     network_connectivity_check
