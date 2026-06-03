@@ -72,6 +72,7 @@ Tests DNS resolution and HTTPS reachability for all required Azure Monitor endpo
 | Global ODS / OMS / agent service | Always |
 | Workspace-specific ODS / OMS | `--workspace-id` provided or auto-detected |
 | Regional control plane | `--region` provided or auto-detected; **skipped in AMPLS mode** (Azure only creates a private DNS zone for the global handler endpoint, not the regional one) |
+| DCE-specific handler endpoint | AMPLS mode only — hostname extracted from `mdsd.info` (`MCS redirected to endpoint` log line) and tested for DNS resolution and HTTPS reachability |
 
 > **AMPLS note:** In AMPLS mode the script always tests the standard `{workspace-id}.ods/oms.opinsights.azure.com` hostnames — not the `.privatelink.` form. The private DNS zones override resolution of the standard hostnames to private IPs, which the DNS test validates. The `.privatelink.` hostnames cause TLS failures because the certificate is issued for `*.ods.opinsights.azure.com`.
 
@@ -105,10 +106,10 @@ When `--cluster-resource-id` is provided, the script uses `az` CLI to check:
 - Container Insights add-on status (enabled / disabled)
 - Authentication mode (Managed Identity vs. Legacy)
 - Data Collection Rule (DCR) and association (DCRA) existence and linkage, including the Data Collection Endpoint (DCE) referenced by the DCR (if any)
-- Daily ingestion cap — alerts if within 20% of the cap or if cap is hit
-- Table-level data activity (last record received per table)
+- Daily ingestion cap — queries `_LogOperation` for cap-hit events in the last 7 days and lists them if found
+- Table-level data activity (last record received per table); if all tables stopped at the same timestamp more than 15 minutes ago, emits an additional warning that the simultaneous cutoff is a strong daily cap indicator
 - **AMPLS mode only:** whether the Log Analytics workspace is a connected resource in the AMPLS private link scope
-- **AMPLS mode only:** whether a DCE is associated with the cluster (via the DCR or a direct DCRA) and is a connected resource in the AMPLS scope — required for configuration delivery over the private link
+- **AMPLS mode only:** whether a DCE is associated with the cluster (via the DCR or a direct DCRA) and is a connected resource in the AMPLS scope — required for configuration delivery over the private link; also checks `publicNetworkAccess` on the DCE (`Disabled` = config refresh will fail if DCE is not in scope; `Enabled` = currently working over public internet but will break if public access is later disabled)
 
 ---
 
