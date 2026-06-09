@@ -564,6 +564,7 @@ network_connectivity_check() {
     # ── HTTPS connectivity tests ──────────────────────────────────────────────
     if [[ -n "$has_curl" ]]; then
         echo -e "\n${Bold}HTTPS Connectivity (curl):${NC}" | tee -a "$net_log"
+        echo -e "  ${Cyan}Note: Any HTTP response (including 4xx) means the endpoint was reached — auth errors are expected on root paths${NC}" | tee -a "$net_log"
         for ep in "${endpoints[@]}"; do
             local http_code
             http_code=$(kubectl exec "${test_pod}" -n kube-system -c ama-logs -- \
