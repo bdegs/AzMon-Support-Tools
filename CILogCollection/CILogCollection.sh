@@ -19,6 +19,10 @@ CLUSTER_REGION=""
 CLUSTER_RESOURCE_ID=""
 USE_AMPLS=false
 DETECTED_DCE_ID=""
+DETECTED_DCR_CLV2=""
+DETECTED_MSI_CLIENT_ID=""
+DETECTED_MSI_OBJECT_ID=""
+DETECTED_MSI_RESOURCE_ID=""
 SKIP_NETWORK=false
 SKIP_ANALYSIS=false
 ANALYSIS_FINDINGS=()
@@ -77,11 +81,16 @@ init() {
         cd ..; rm -rf "$output_path"; exit 1
     fi
 
-    local node_check
+    local node_check node_exit
     node_check=$(kubectl get nodes 2>&1)
-    if [[ $node_check == *"refused"* ]] || [[ $node_check == *"unable to connect"* ]] || [[ $node_check == *"was refused"* ]]; then
-        echo -e "${Red}[ERROR] Cannot connect to the cluster." | tee -a Tool.log
-        echo -e "        Run: az aks get-credentials --resource-group <RG> --name <CLUSTER>${NC}" | tee -a Tool.log
+    node_exit=$?
+    if [[ $node_exit -ne 0 ]]; then
+        echo -e "${Red}[ERROR] Cannot connect to the cluster (kubectl exited with code ${node_exit}).${NC}" | tee -a Tool.log
+        echo -e "${Red}        kubectl output:${NC}" | tee -a Tool.log
+        echo "$node_check" | sed 's/^/          /' | tee -a Tool.log
+        echo -e "${Red}        Verify your kubeconfig is set and the API server is reachable:" | tee -a Tool.log
+        echo -e "          kubectl config current-context" | tee -a Tool.log
+        echo -e "          az aks get-credentials --resource-group <RG> --name <CLUSTER>${NC}" | tee -a Tool.log
         cd ..; rm -rf "$output_path"; exit 1
     fi
 
@@ -159,6 +168,50 @@ derive_cluster_info() {
         fi
     fi
 
+    # Auto-detect CLUSTER_RESOURCE_ID via IMDS from inside the DS pod. ama-logs DS runs with
+    # hostNetwork=true so 169.254.169.254 is reachable. AKS-managed VMSS instances carry
+    # 'aks-managed-cluster-name' and 'aks-managed-cluster-rg' tags that, combined with the
+    # subscription ID from IMDS compute metadata, give the full cluster resource ID — enabling
+    # azure_config_check to run by default.
+    if [[ -z "$CLUSTER_RESOURCE_ID" ]] && [[ -n "$ds_pod" ]] && type -p python3 > /dev/null 2>&1; then
+        local imds_compute
+        imds_compute=$(kubectl exec "${ds_pod}" -n kube-system -c ama-logs -- \
+            curl -s --connect-timeout 5 --max-time 10 -H "Metadata:true" \
+            "http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01" 2>/dev/null)
+
+        if [[ -n "$imds_compute" ]] && echo "$imds_compute" | grep -q '"subscriptionId"'; then
+            local derived_id
+            derived_id=$(echo "$imds_compute" | python3 -c "
+import sys, json, re
+try:
+    d = json.load(sys.stdin)
+    sub = d.get('subscriptionId','')
+    tags = {t.get('name'): t.get('value') for t in d.get('tagsList',[]) if t.get('name')}
+    cn = tags.get('aks-managed-cluster-name','')
+    cr = tags.get('aks-managed-cluster-rg','')
+    if not (cn and cr):
+        mc = d.get('resourceGroupName','')
+        m = re.match(r'^MC_(.+)_([^_]+)_[^_]+$', mc)
+        if m:
+            cr, cn = m.group(1), m.group(2)
+    if sub and cn and cr:
+        print(f'/subscriptions/{sub}/resourceGroups/{cr}/providers/Microsoft.ContainerService/managedClusters/{cn}')
+except Exception:
+    pass
+" 2>/dev/null)
+            if [[ -n "$derived_id" ]]; then
+                CLUSTER_RESOURCE_ID="$derived_id"
+                echo -e "Auto-detected cluster resource ID via IMDS: ${Cyan}${CLUSTER_RESOURCE_ID}${NC}" | tee -a Tool.log
+            else
+                echo -e "${Yellow}[WARN] IMDS reachable but could not derive the cluster resource ID from tags or MC_ name." | tee -a Tool.log
+                echo -e "       Pass --cluster-resource-id to enable Azure configuration checks.${NC}" | tee -a Tool.log
+            fi
+        else
+            echo -e "${Cyan}[INFO] IMDS (169.254.169.254) was not reachable from the agent pod — cluster resource ID auto-detection skipped." | tee -a Tool.log
+            echo -e "       Pass --cluster-resource-id to enable Azure configuration checks.${NC}" | tee -a Tool.log
+        fi
+    fi
+
     # Auto-detect AMPLS: if the ODS endpoint resolves to a private RFC1918 address, the cluster
     # is behind a private link scope. Skip if --ampls was already passed explicitly.
     if ! $USE_AMPLS && [[ -n "$WORKSPACE_ID" ]]; then
@@ -179,6 +232,45 @@ derive_cluster_info() {
     fi
 }
 
+# ─── _classify_previous_logs ──────────────────────────────────────────────────
+# Inspect `kubectl describe pod` output to decide whether a previous restart
+# was graceful (config reload, rollout restart, node drain) or a real crash.
+# Sets four caller-scoped variables (caller MUST declare them `local` first
+# AND NOT call this via command substitution — that would run in a subshell
+# and the assignments wouldn't survive):
+#   last_class  — "graceful" or "crash"
+#   last_reason — Last State Reason   (e.g. Completed, Error, OOMKilled)
+#   last_exit   — Last State ExitCode (0 / 143 = graceful, 137 = OOM, etc.)
+#   last_msg    — Last State Message  (sometimes empty)
+# Three graceful signals — any one is enough:
+#   - Reason = Completed
+#   - Exit Code = 0 or 143 (SIGTERM = 128+15, sent by kubelet on a probe-driven
+#     kill or graceful pod termination)
+#   - Message contains a config-change marker — the agent's own way of saying
+#     "I shut myself down to pick up new config"
+_classify_previous_logs() {
+    local desc="$1"
+    last_reason=$(awk '
+        /^[[:space:]]*Last State:[[:space:]]*Terminated/ { capture=1; next }
+        capture && /^[[:space:]]*Reason:/                { print $2; exit }
+    ' "$desc" 2>/dev/null)
+    last_exit=$(awk '
+        /^[[:space:]]*Last State:[[:space:]]*Terminated/ { capture=1; next }
+        capture && /^[[:space:]]*Exit Code:/             { print $3; exit }
+    ' "$desc" 2>/dev/null)
+    last_msg=$(awk '
+        /^[[:space:]]*Last State:[[:space:]]*Terminated/ { capture=1; next }
+        capture && /^[[:space:]]*Message:/ { sub(/^[[:space:]]*Message:[[:space:]]*/, ""); print; exit }
+    ' "$desc" 2>/dev/null)
+    if [[ "$last_reason" == "Completed" || "$last_exit" == "0" || "$last_exit" == "143" ]]; then
+        last_class=graceful; return
+    fi
+    if echo "$last_msg" | grep -qiE "config[[:space:]]*changed|inotifyoutput|config[[:space:]]*map[[:space:]]*updated"; then
+        last_class=graceful; return
+    fi
+    last_class=crash
+}
+
 # ─── ds_logCollection ─────────────────────────────────────────────────────────
 ds_logCollection() {
     echo -e "\nCollecting logs from DaemonSet pod: ${ds_pod}..." | tee -a Tool.log
@@ -187,9 +279,18 @@ ds_logCollection() {
     kubectl logs "${ds_pod}" --container ama-logs --namespace=kube-system > "ama-logs-daemonset/logs_${ds_pod}.txt" 2>&1
     kubectl logs "${ds_pod}" --container ama-logs-prometheus --namespace=kube-system > "ama-logs-prom-daemonset/logs_${ds_pod}_prom.txt" 2>/dev/null
     if kubectl logs "${ds_pod}" --container ama-logs --namespace=kube-system --previous > "ama-logs-daemonset/logs_${ds_pod}_previous.txt" 2>/dev/null; then
-        echo -e "  ${Yellow}[WARN] Previous (pre-restart) logs collected for ${ds_pod} - this pod has restarted at least once.${NC}" | tee -a Tool.log
-        echo -e "         Restarts often indicate crashes due to resource limits (OOMKill), configuration errors," | tee -a Tool.log
-        echo -e "         or a failing dependency. Review ama-logs-daemonset/logs_${ds_pod}_previous.txt to see what caused the restart.${NC}" | tee -a Tool.log
+        local last_class last_reason last_exit last_msg
+        _classify_previous_logs "ama-logs-daemonset/describe_${ds_pod}.txt"
+        if [[ "$last_class" == "graceful" ]]; then
+            echo -e "  ${Cyan}[INFO] Previous (pre-restart) logs collected for ${ds_pod} — restart appears graceful (Reason=${last_reason:-?}, ExitCode=${last_exit:-?}).${NC}" | tee -a Tool.log
+            [[ -n "$last_msg" ]] && echo -e "         Last State Message: ${last_msg}" | tee -a Tool.log
+            echo -e "         Typically a ConfigMap update, 'kubectl rollout restart', or a node drain — not a crash. Previous logs are still saved for context." | tee -a Tool.log
+        else
+            echo -e "  ${Yellow}[WARN] Previous (pre-restart) logs collected for ${ds_pod} - this pod has restarted at least once.${NC}" | tee -a Tool.log
+            echo -e "         Last termination: Reason=${last_reason:-unknown}, ExitCode=${last_exit:-unknown} — looks like a crash." | tee -a Tool.log
+            [[ -n "$last_msg" ]] && echo -e "         Last State Message: ${last_msg}" | tee -a Tool.log
+            echo -e "         Review ama-logs-daemonset/logs_${ds_pod}_previous.txt to see what caused the restart.${NC}" | tee -a Tool.log
+        fi
     fi
     kubectl exec "${ds_pod}" -n kube-system -c ama-logs --request-timeout=10m -- ps -ef > "ama-logs-daemonset/process_${ds_pod}.txt" 2>/dev/null
 
@@ -224,7 +325,9 @@ ds_logCollection() {
         # A missing or empty configchunks dir means the agent has not received its DCR config.
         local chunk_count
         chunk_count=$(kubectl exec "${ds_pod}" -n kube-system -c ama-logs \
-            -- ls /etc/mdsd.d/config-cache/configchunks/ 2>/dev/null | grep -c '.json' || echo 0)
+            -- sh -c 'ls /etc/mdsd.d/config-cache/configchunks/ 2>/dev/null | grep -c "\.json$"' 2>/dev/null \
+            | tr -d '[:space:]')
+        [[ "$chunk_count" =~ ^[0-9]+$ ]] || chunk_count=0
         if [[ "$chunk_count" -eq 0 ]]; then
             echo -e "${Red}[ISSUE] DCR configuration files (configchunks) are missing on ${ds_pod}." | tee -a Tool.log
             echo -e "        The agent has NOT received its Data Collection Rule (DCR) — the instructions from" | tee -a Tool.log
@@ -314,9 +417,18 @@ rs_logCollection() {
     kubectl describe pod "${rs_pod}" --namespace=kube-system > "ama-logs-replicaset/describe_${rs_pod}.txt" 2>&1
     kubectl logs "${rs_pod}" --container ama-logs --namespace=kube-system > "ama-logs-replicaset/logs_${rs_pod}.txt" 2>&1
     if kubectl logs "${rs_pod}" --container ama-logs --namespace=kube-system --previous > "ama-logs-replicaset/logs_${rs_pod}_previous.txt" 2>/dev/null; then
-        echo -e "  ${Yellow}[WARN] Previous (pre-restart) logs collected for ${rs_pod} - this pod has restarted at least once.${NC}" | tee -a Tool.log
-        echo -e "         Restarts often indicate crashes due to resource limits (OOMKill), configuration errors," | tee -a Tool.log
-        echo -e "         or a failing dependency. Review ama-logs-replicaset/logs_${rs_pod}_previous.txt to see what caused the restart.${NC}" | tee -a Tool.log
+        local last_class last_reason last_exit last_msg
+        _classify_previous_logs "ama-logs-replicaset/describe_${rs_pod}.txt"
+        if [[ "$last_class" == "graceful" ]]; then
+            echo -e "  ${Cyan}[INFO] Previous (pre-restart) logs collected for ${rs_pod} — restart appears graceful (Reason=${last_reason:-?}, ExitCode=${last_exit:-?}).${NC}" | tee -a Tool.log
+            [[ -n "$last_msg" ]] && echo -e "         Last State Message: ${last_msg}" | tee -a Tool.log
+            echo -e "         Typically a ConfigMap update, 'kubectl rollout restart', or a node drain — not a crash. Previous logs are still saved for context." | tee -a Tool.log
+        else
+            echo -e "  ${Yellow}[WARN] Previous (pre-restart) logs collected for ${rs_pod} - this pod has restarted at least once.${NC}" | tee -a Tool.log
+            echo -e "         Last termination: Reason=${last_reason:-unknown}, ExitCode=${last_exit:-unknown} — looks like a crash." | tee -a Tool.log
+            [[ -n "$last_msg" ]] && echo -e "         Last State Message: ${last_msg}" | tee -a Tool.log
+            echo -e "         Review ama-logs-replicaset/logs_${rs_pod}_previous.txt to see what caused the restart.${NC}" | tee -a Tool.log
+        fi
     fi
     kubectl exec "${rs_pod}" -n kube-system -c ama-logs --request-timeout=10m -- ps -ef > "ama-logs-replicaset/process_${rs_pod}.txt" 2>/dev/null
 
@@ -342,7 +454,9 @@ rs_logCollection() {
 
         local chunk_count
         chunk_count=$(kubectl exec "${rs_pod}" -n kube-system -c ama-logs \
-            -- ls /etc/mdsd.d/config-cache/configchunks/ 2>/dev/null | grep -c '.json' || echo 0)
+            -- sh -c 'ls /etc/mdsd.d/config-cache/configchunks/ 2>/dev/null | grep -c "\.json$"' 2>/dev/null \
+            | tr -d '[:space:]')
+        [[ "$chunk_count" =~ ^[0-9]+$ ]] || chunk_count=0
         if [[ "$chunk_count" -eq 0 ]]; then
             echo -e "${Red}[ISSUE] DCR configchunks directory is empty on RS pod ${rs_pod}.${NC}" | tee -a Tool.log
             ANALYSIS_FINDINGS+=("CRITICAL: DCR configchunks empty on RS pod ${rs_pod}. Agent has not received DCR config.")
@@ -407,9 +521,21 @@ other_logCollection() {
     # Node info + quick status snapshots for the archive
     kubectl get nodes > cluster/node.txt 2>&1
     kubectl get nodes -o json > cluster/node-detailed.json 2>&1
+    kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .status.conditions[?(@.status=="True")]}{.type}{","}{end}{"\n"}{end}' > cluster/node-conditions.txt 2>&1
     kubectl get daemonset -n kube-system | grep ama-logs > cluster/daemonset-status.txt 2>&1
     kubectl get pods -n kube-system | grep ama-logs > cluster/pod-status.txt 2>&1
-    kubectl get events -n kube-system --sort-by='.lastTimestamp' 2>/dev/null | grep -i ama-logs > cluster/ama-logs-events.txt 2>&1
+    # Capture ama-logs-related events with three filters: name-targeted, then a broader
+    # keyword grep covering Container Insights addon, MSI auth, AMPLS, Helm rollouts, image
+    # pull, scheduling, and mount failures. Empty by design when nothing is wrong.
+    {
+        echo "=== Events involving ama-logs pods (name match) ==="
+        kubectl get events -n kube-system --sort-by='.lastTimestamp' 2>/dev/null \
+            | awk 'NR==1 || /ama-logs/'
+        echo ""
+        echo "=== Events matching Container Insights / MSI / AMPLS / Helm / pull / schedule patterns ==="
+        kubectl get events -n kube-system --sort-by='.lastTimestamp' 2>/dev/null \
+            | grep -iE 'ama-logs|MSCI|amcs|ampls|aks-managed-azure-monitor-logs|addon-token-adapter|FailedMount|FailedScheduling|ImagePullBackOff|ErrImagePull|Unhealthy|BackOff'
+    } > cluster/ama-logs-events.txt 2>&1
     kubectl get networkpolicy -n kube-system -o yaml > cluster/network-policies.yaml 2>&1
     kubectl get serviceaccount ama-logs -n kube-system -o yaml > cluster/serviceaccount-ama-logs.yaml 2>&1
 
@@ -422,6 +548,50 @@ other_logCollection() {
     if [[ -n "$agent_image" ]]; then
         echo -e "  ${Cyan}[INFO] ama-logs image: ${agent_image}${NC}" | tee -a Tool.log
         echo "ama-logs image: ${agent_image}" > cluster/agent-version.txt
+
+        # Compare the running tag against the latest tag published on Microsoft Container Registry.
+        # Linux Container Insights tags follow a 3.x.y semver pattern; anything else is ignored.
+        local current_tag latest_tag versions_behind
+        current_tag="${agent_image##*:}"
+        if [[ "$current_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && type -p curl > /dev/null 2>&1 && type -p python3 > /dev/null 2>&1; then
+            local mcr_tags_json
+            mcr_tags_json=$(curl -s --connect-timeout 5 --max-time 10 \
+                https://mcr.microsoft.com/v2/azuremonitor/containerinsights/ciprod/tags/list 2>/dev/null)
+            if [[ -n "$mcr_tags_json" ]]; then
+                read -r latest_tag versions_behind <<< "$(echo "$mcr_tags_json" | CURRENT="$current_tag" python3 -c "
+import sys, json, os, re
+try:
+    tags = json.load(sys.stdin).get('tags',[])
+    semver = sorted(
+        [t for t in tags if re.match(r'^[0-9]+\.[0-9]+\.[0-9]+$', t)],
+        key=lambda v: tuple(int(p) for p in v.split('.'))
+    )
+    if not semver:
+        sys.exit(0)
+    latest = semver[-1]
+    cur = os.environ.get('CURRENT','')
+    cur_tuple = tuple(int(p) for p in cur.split('.'))
+    behind = sum(1 for t in semver if tuple(int(p) for p in t.split('.')) > cur_tuple)
+    print(f'{latest} {behind}')
+except Exception:
+    pass
+" 2>/dev/null)"
+                if [[ -n "$latest_tag" ]]; then
+                    echo "latest published tag: ${latest_tag} (${versions_behind:-0} releases newer than running)" >> cluster/agent-version.txt
+                    if [[ "$latest_tag" == "$current_tag" ]]; then
+                        echo -e "  ${Green}[OK] ama-logs image is current (${current_tag} = latest published).${NC}" | tee -a Tool.log
+                    elif [[ "${versions_behind:-0}" -ge 5 ]]; then
+                        echo -e "  ${Red}[ISSUE] ama-logs image is significantly out of date: running ${current_tag}, latest is ${latest_tag} (${versions_behind} releases behind).${NC}" | tee -a Tool.log
+                        echo -e "          Older agent builds frequently lack DCR features, AMPLS fixes, and crash fixes." | tee -a Tool.log
+                        echo -e "          -> Trigger an AKS image upgrade (the addon image cycles with cluster updates)," | tee -a Tool.log
+                        echo -e "             or manually patch the ama-logs DaemonSet if the customer is pinning a tag." | tee -a Tool.log
+                        ANALYSIS_FINDINGS+=("ama-logs agent image ${current_tag} is ${versions_behind} releases behind latest (${latest_tag}). Trigger an image upgrade — older builds frequently lack DCR/AMPLS fixes.")
+                    else
+                        echo -e "  ${Yellow}[WARN] ama-logs image is ${versions_behind} release(s) behind latest: running ${current_tag}, latest is ${latest_tag}. Consider upgrading.${NC}" | tee -a Tool.log
+                    fi
+                fi
+            fi
+        fi
     fi
 
     # Resource usage snapshot (requires metrics-server)
@@ -466,6 +636,23 @@ network_connectivity_check() {
         echo "AMPLS mode:   ${USE_AMPLS}"
         echo ""
     } > "$net_log"
+
+    # ── Proxy environment check ──────────────────────────────────────────────
+    # If HTTP_PROXY/HTTPS_PROXY are set inside the pod, all curl traffic below traverses the proxy.
+    # Surface these explicitly so a failing connectivity test isn't blamed on the wrong network path.
+    local proxy_env
+    proxy_env=$(kubectl exec "${test_pod}" -n kube-system -c ama-logs -- env 2>/dev/null \
+        | grep -iE '^(HTTP_PROXY|HTTPS_PROXY|NO_PROXY)=' || true)
+    if [[ -n "$proxy_env" ]]; then
+        echo -e "\n${Bold}Proxy Configuration Detected:${NC}" | tee -a "$net_log"
+        echo -e "  ${Cyan}The agent pod has proxy environment variables set — all outbound HTTPS traffic from the agent" | tee -a "$net_log"
+        echo -e "  traverses this proxy. The connectivity tests below honor these variables, so failures may indicate" | tee -a "$net_log"
+        echo -e "  proxy ACLs, TLS interception, or NO_PROXY misconfiguration rather than a direct firewall block.${NC}" | tee -a "$net_log"
+        echo "$proxy_env" | sed 's/^/    /' | tee -a "$net_log"
+        ANALYSIS_FINDINGS+=("Proxy env vars set in agent pod. All outbound agent traffic goes through this proxy — verify proxy allowlists and NO_PROXY excludes do not block Azure Monitor endpoints.")
+    else
+        echo -e "\n${Cyan}[INFO] No HTTP_PROXY/HTTPS_PROXY environment variables detected in the agent pod.${NC}" | tee -a "$net_log"
+    fi
 
     # Check which tools are available inside the pod
     local has_curl has_nslookup
@@ -591,6 +778,82 @@ network_connectivity_check() {
         echo -e "  ${Yellow}[SKIP] curl not found in the agent pod - HTTPS connectivity tests skipped.${NC}" | tee -a "$net_log"
     fi
 
+    # ── Managed Identity token acquisition test (via IMDS) ────────────────────
+    # Validates that the kubelet (or assigned) managed identity can actually obtain an OAuth
+    # token for the monitor.azure.com audience used by AMCS (DCR config delivery) and DCE
+    # (log ingestion). A failure here means the agent identity cannot authenticate regardless
+    # of network reachability. Uses DS pod specifically because it runs hostNetwork=true and
+    # therefore can reach IMDS at 169.254.169.254; RS pods cannot.
+    if [[ -n "$ds_pod" ]]; then
+        echo -e "\n${Bold}Managed Identity Token Test (IMDS):${NC}" | tee -a "$net_log"
+        local ds_has_curl
+        ds_has_curl=$(kubectl exec "${ds_pod}" -n kube-system -c ama-logs -- which curl 2>/dev/null)
+        if [[ -n "$ds_has_curl" ]]; then
+            local msi_test
+            msi_test=$(kubectl exec "${ds_pod}" -n kube-system -c ama-logs -- \
+                curl -s --connect-timeout 10 --max-time 15 -H "Metadata:true" \
+                "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://monitor.azure.com/" 2>/dev/null)
+
+            if echo "$msi_test" | grep -q '"access_token"'; then
+                echo -e "  ${Green}[OK] Managed identity acquired a token for https://monitor.azure.com/${NC}" | tee -a "$net_log"
+                echo -e "       The agent's identity is correctly configured to authenticate against AMCS and DCE." | tee -a "$net_log"
+
+                # Decode the JWT payload to surface WHICH managed identity actually issued the token.
+                # The agent never logs its identity directly, so this is the only way to confirm — from
+                # inside the cluster — which UA/system MI is being used (and therefore which one needs
+                # the Monitoring Metrics Publisher / Log Analytics Contributor role on the DCR/workspace).
+                if type -p python3 > /dev/null 2>&1; then
+                    local jwt_claims
+                    jwt_claims=$(echo "$msi_test" | python3 -c "
+import sys, json, base64
+try:
+    d = json.load(sys.stdin)
+    token = d.get('access_token','')
+    parts = token.split('.')
+    if len(parts) >= 2:
+        p = parts[1] + '=' * (-len(parts[1]) % 4)
+        c = json.loads(base64.urlsafe_b64decode(p.encode()))
+        print(c.get('appid',''))
+        print(c.get('oid',''))
+        print(c.get('xms_mirid',''))
+except Exception:
+    pass
+" 2>/dev/null)
+                    DETECTED_MSI_CLIENT_ID=$(echo "$jwt_claims" | sed -n '1p')
+                    DETECTED_MSI_OBJECT_ID=$(echo "$jwt_claims" | sed -n '2p')
+                    DETECTED_MSI_RESOURCE_ID=$(echo "$jwt_claims" | sed -n '3p')
+                    if [[ -n "$DETECTED_MSI_CLIENT_ID" ]]; then
+                        echo -e "       ${Cyan}Identity in use:${NC}" | tee -a "$net_log"
+                        echo -e "         clientId:   ${DETECTED_MSI_CLIENT_ID}" | tee -a "$net_log"
+                        [[ -n "$DETECTED_MSI_OBJECT_ID" ]]   && echo -e "         objectId:   ${DETECTED_MSI_OBJECT_ID}"   | tee -a "$net_log"
+                        [[ -n "$DETECTED_MSI_RESOURCE_ID" ]] && echo -e "         resourceId: ${DETECTED_MSI_RESOURCE_ID}" | tee -a "$net_log"
+                    fi
+                fi
+            elif echo "$msi_test" | grep -qE '"error"|"error_description"'; then
+                local err_msg
+                err_msg=$(echo "$msi_test" | grep -oP '"error_description"\s*:\s*"\K[^"]+' | head -1)
+                [[ -z "$err_msg" ]] && err_msg=$(echo "$msi_test" | grep -oP '"error"\s*:\s*"\K[^"]+' | head -1)
+                echo -e "  ${Red}[ISSUE] Managed identity failed to acquire a token for https://monitor.azure.com/${NC}" | tee -a "$net_log"
+                echo -e "          IMDS error: ${err_msg:-(unparseable response)}" | tee -a "$net_log"
+                echo -e "          The agent cannot authenticate to AMCS or DCE — DCR config will not deliver and" | tee -a "$net_log"
+                echo -e "          ingestion will be rejected. Common causes:" | tee -a "$net_log"
+                echo -e "            - Kubelet identity is missing, or addon was deployed without managed identity" | tee -a "$net_log"
+                echo -e "            - User-assigned identity not attached to the node VMSS" | tee -a "$net_log"
+                echo -e "            - Workload identity is configured but federated trust is misconfigured" | tee -a "$net_log"
+                ANALYSIS_FINDINGS+=("MSI token acquisition failed inside ama-logs DS pod: ${err_msg:-no token returned}. The agent's managed identity cannot authenticate to monitor.azure.com — review kubelet identity attachment on the node VMSS.")
+            else
+                echo -e "  ${Yellow}[WARN] IMDS at 169.254.169.254 did not respond or returned an unparseable body.${NC}" | tee -a "$net_log"
+                echo -e "         Either a NetworkPolicy/NSG is blocking IMDS, or the DaemonSet has lost hostNetwork." | tee -a "$net_log"
+                echo -e "         IMDS is required for MSI authentication; without it the agent cannot get a token." | tee -a "$net_log"
+                ANALYSIS_FINDINGS+=("IMDS (169.254.169.254) unreachable from ama-logs DS pod. Verify hostNetwork=true on the DaemonSet and that no NetworkPolicy blocks 169.254.169.254.")
+            fi
+        else
+            echo -e "  ${Yellow}[SKIP] curl not available in DS pod - MSI token test skipped.${NC}" | tee -a "$net_log"
+        fi
+    else
+        echo -e "\n  ${Cyan}[INFO] MSI token test skipped — no DaemonSet pod available (test requires hostNetwork to reach IMDS).${NC}" | tee -a "$net_log"
+    fi
+
     # ── SSL inspection hint ───────────────────────────────────────────────────
     echo -e "\n${Cyan}SSL Inspection Check (run manually if data is missing despite passing tests above):" | tee -a "$net_log"
     echo -e "  kubectl exec -it ${test_pod} -n kube-system -c ama-logs -- /bin/bash" | tee -a "$net_log"
@@ -675,6 +938,53 @@ analyze_collected_logs() {
     }
 
     local found_any=false
+
+    # ── mdsd.info pipeline-success parse ──────────────────────────────────────
+    # Two specific log lines in mdsd.info prove the end-to-end Azure pipeline is working
+    # without needing any Azure CLI access:
+    #   1. "MCS redirected to endpoint https://<dce-fqdn>"   -> AMCS reached + DCE association is live
+    #   2. "Retrieved gig token for configuration id [dcr-…] channel id [ods-…]"
+    #                                                         -> identity auth + DCR delivery + ingestion
+    #                                                            token issuance all succeeded end-to-end
+    # When both are present, AMCS/DCE/DCR/MSI are all proven from inside the cluster — the
+    # azure_config_check section becomes a reconciliation pass rather than a primary check.
+    for mdsd_info in ama-logs-daemonset-mdsd/mdsd.info ama-logs-replicaset-mdsd/mdsd.info; do
+        [[ ! -f "$mdsd_info" ]] && continue
+        echo -e "\nChecking ${mdsd_info} for proof of end-to-end AMCS / DCE / DCR pipeline..." | tee -a "$analysis_log"
+
+        local mcs_line gig_line
+        mcs_line=$(grep -m1 "MCS redirected to endpoint" "$mdsd_info" 2>/dev/null)
+        gig_line=$(grep -m1 "Retrieved gig token for configuration id" "$mdsd_info" 2>/dev/null)
+
+        if [[ -n "$mcs_line" ]] && [[ -n "$gig_line" ]]; then
+            local mcs_dce dcr_id_seen
+            mcs_dce=$(echo "$mcs_line"  | grep -oE 'https://[^ ]+' | head -1)
+            dcr_id_seen=$(echo "$gig_line" | grep -oP 'configuration id \[\K[^]]+' | head -1)
+            echo -e "  ${Green}[OK] End-to-end pipeline proven via mdsd.info:${NC}" | tee -a "$analysis_log"
+            echo -e "       MCS -> DCE redirect:  ${mcs_dce:-(captured)}" | tee -a "$analysis_log"
+            echo -e "       DCR config delivered: ${dcr_id_seen:-(captured)}" | tee -a "$analysis_log"
+            echo -e "       Ingestion (gig) token successfully retrieved from the DCE." | tee -a "$analysis_log"
+        else
+            if [[ -z "$mcs_line" ]]; then
+                echo -e "  ${Red}[ISSUE] No 'MCS redirected to endpoint' line found in ${mdsd_info}.${NC}" | tee -a "$analysis_log"
+                echo -e "          The agent never reached AMCS (global.handler.control.monitor.azure.com)" | tee -a "$analysis_log"
+                echo -e "          or AMCS did not return a DCE endpoint for this cluster. Likely causes:" | tee -a "$analysis_log"
+                echo -e "            - global.handler.control.monitor.azure.com is blocked by firewall/NSG" | tee -a "$analysis_log"
+                echo -e "            - AMPLS misconfigured (DCE/workspace not connected resources)" | tee -a "$analysis_log"
+                echo -e "            - No DCR association exists on the cluster resource" | tee -a "$analysis_log"
+                ANALYSIS_FINDINGS+=("${mdsd_info}: no MCS redirect logged — the agent never reached AMCS or AMCS returned no DCE for this cluster. Review network reachability of global.handler.control.monitor.azure.com and the cluster's DCR association.")
+                found_any=true
+            fi
+            if [[ -z "$gig_line" ]]; then
+                echo -e "  ${Red}[ISSUE] No 'Retrieved gig token' line found in ${mdsd_info}.${NC}" | tee -a "$analysis_log"
+                echo -e "          MCS redirect succeeded but the agent could not get an ingestion token from" | tee -a "$analysis_log"
+                echo -e "          the DCE. This means MSI auth to the DCE is failing OR the DCE is not a" | tee -a "$analysis_log"
+                echo -e "          connected resource in the AMPLS scope. Cross-check the DCE AMPLS section." | tee -a "$analysis_log"
+                ANALYSIS_FINDINGS+=("${mdsd_info}: no gig token retrieval logged — DCE auth or DCE-AMPLS association is failing. Cross-check the DCE AMPLS section of azure-config-check.log.")
+                found_any=true
+            fi
+        fi
+    done
 
     # ── mdsd.err ─────────────────────────────────────────────────────────────
     for mdsd_err in ama-logs-daemonset-mdsd/mdsd.err ama-logs-replicaset-mdsd/mdsd.err; do
@@ -815,7 +1125,7 @@ analyze_collected_logs() {
     # ── OOMKill / restart count ───────────────────────────────────────────────
     for desc in ama-logs-daemonset/describe_*.txt ama-logs-replicaset/describe_*.txt ama-logs-windows-daemonset/describe_*.txt; do
         [[ ! -f "$desc" ]] && continue
-        echo -e "\nAnalyzing ${desc} for restarts and OOMKill..." | tee -a "$analysis_log"
+        echo -e "\nAnalyzing ${desc} for restarts, OOMKill, and probe failures..." | tee -a "$analysis_log"
 
         local oom_count restart_count
         oom_count=$(grep -c "OOMKilled" "$desc" 2>/dev/null)
@@ -833,15 +1143,183 @@ analyze_collected_logs() {
             ANALYSIS_FINDINGS+=("OOMKilled in ${desc}: container killed by memory pressure. Review resource limits or reduce collection scope.")
             found_any=true
         elif [[ "$restart_count" -gt 3 ]]; then
-            echo -e "  ${Yellow}[WARN] Elevated restart count (${restart_count}) detected in ${desc}." | tee -a "$analysis_log"
-            echo -e "         The ama-logs container has restarted ${restart_count} time(s), which may indicate crashes or" | tee -a "$analysis_log"
-            echo -e "         repeated OOM kills. Check previous pod logs (logs_*_previous.txt) for the crash reason.${NC}" | tee -a "$analysis_log"
-            ANALYSIS_FINDINGS+=("High restart count (${restart_count}) in ${desc}. Review logs_*_previous.txt for crash reason.")
-            found_any=true
+            # Distinguish a real crash from a graceful restart (kubectl rollout restart,
+            # a ConfigMap update that trips the inotify-driven liveness probe, a node
+            # drain, etc.). Three "graceful" signals — any one is enough:
+            #   - Last State Reason = Completed
+            #   - Last State ExitCode = 0 or 143 (SIGTERM = 128+15 — what kubelet sends
+            #     when killing a container for liveness-probe failure or pod termination)
+            #   - Last State Message mentions inotify / config change — the agent's own
+            #     way of telling us "I shut myself down to reload config"
+            local last_reason last_exit last_msg
+            last_reason=$(awk '
+                /^[[:space:]]*Last State:[[:space:]]*Terminated/ { capture=1; next }
+                capture && /^[[:space:]]*Reason:/                { print $2; exit }
+            ' "$desc" 2>/dev/null)
+            last_exit=$(awk '
+                /^[[:space:]]*Last State:[[:space:]]*Terminated/ { capture=1; next }
+                capture && /^[[:space:]]*Exit Code:/             { print $3; exit }
+            ' "$desc" 2>/dev/null)
+            last_msg=$(awk '
+                /^[[:space:]]*Last State:[[:space:]]*Terminated/ { capture=1; next }
+                capture && /^[[:space:]]*Message:/ { sub(/^[[:space:]]*Message:[[:space:]]*/, ""); print; exit }
+            ' "$desc" 2>/dev/null)
+
+            local agent_self_restart=0
+            if echo "$last_msg" | grep -qiE "config[[:space:]]*changed|inotifyoutput|config[[:space:]]*map[[:space:]]*updated"; then
+                agent_self_restart=1
+            fi
+
+            if [[ "$agent_self_restart" -eq 1 ]]; then
+                echo -e "  ${Cyan}[INFO] Restart count ${restart_count} in ${desc} — the agent self-terminated to reload config.${NC}" | tee -a "$analysis_log"
+                echo -e "         Last State Message: ${last_msg}" | tee -a "$analysis_log"
+                echo -e "         This is the standard reaction to a ConfigMap update (the inotify watcher trips the" | tee -a "$analysis_log"
+                echo -e "         liveness probe, kubelet SIGTERMs the container, mdsd restarts and picks up the new config). Not flagged." | tee -a "$analysis_log"
+            elif [[ "$last_reason" == "Completed" || "$last_exit" == "0" || "$last_exit" == "143" ]]; then
+                echo -e "  ${Cyan}[INFO] Restart count ${restart_count} in ${desc} but last termination was graceful (Reason=${last_reason:-?}, ExitCode=${last_exit:-?}).${NC}" | tee -a "$analysis_log"
+                echo -e "         Typically caused by a ConfigMap update, 'kubectl rollout restart', or a node drain — not a crash. Not flagged." | tee -a "$analysis_log"
+            else
+                echo -e "  ${Yellow}[WARN] Elevated restart count (${restart_count}) detected in ${desc}." | tee -a "$analysis_log"
+                echo -e "         Last termination: Reason=${last_reason:-unknown}, ExitCode=${last_exit:-unknown} — looks like a crash." | tee -a "$analysis_log"
+                [[ -n "$last_msg" ]] && echo -e "         Last State Message: ${last_msg}" | tee -a "$analysis_log"
+                echo -e "         Check previous pod logs (logs_*_previous.txt) for the crash reason.${NC}" | tee -a "$analysis_log"
+                ANALYSIS_FINDINGS+=("High restart count (${restart_count}) in ${desc} (Reason=${last_reason:-unknown}, ExitCode=${last_exit:-unknown}). Review logs_*_previous.txt.")
+                found_any=true
+            fi
         else
             echo -e "  ${Green}[OK] No OOMKill events detected. Restart count: ${restart_count}.${NC}" | tee -a "$analysis_log"
         fi
+
+        local probe_count
+        probe_count=$(grep -ciE "Liveness probe failed|Readiness probe failed" "$desc" 2>/dev/null)
+        probe_count="${probe_count:-0}"
+        if [[ "$probe_count" -gt 0 ]]; then
+            # The probe-failure event line follows the kubectl-events format
+            #   "  Warning  Unhealthy  <Age>  (xN over Ym)  kubelet  spec.containers{X}: <Message>"
+            # where <Age> is the most-recent occurrence age. Treat the failure as benign
+            # if either:
+            #   (a) the Message field contains an agent-side config-change marker, OR
+            #   (b) the age is older than 10 minutes AND the container is now Running
+            #       Ready (the failure already led to a successful restart and the agent
+            #       has been stable since).
+            local last_probe last_age last_age_min=0 is_config_triggered=0
+            last_probe=$(grep -iE "Liveness probe failed|Readiness probe failed" "$desc" | tail -1)
+            last_age=$(echo "$last_probe" | awk '{print $3}')
+            if [[ "$last_age" =~ ^([0-9]+)([smhd])$ ]]; then
+                local _n="${BASH_REMATCH[1]}" _u="${BASH_REMATCH[2]}"
+                case "$_u" in
+                    s) last_age_min=$(( _n / 60 )) ;;
+                    m) last_age_min=$_n ;;
+                    h) last_age_min=$(( _n * 60 )) ;;
+                    d) last_age_min=$(( _n * 1440 )) ;;
+                esac
+            fi
+            if echo "$last_probe" | grep -qiE "config[[:space:]]*map[[:space:]]*updated|inotifyoutput|config[[:space:]]*changed"; then
+                is_config_triggered=1
+            fi
+
+            if [[ "$is_config_triggered" -eq 1 ]]; then
+                echo -e "  ${Cyan}[INFO] Probe failures in ${desc} (${probe_count} occurrence(s)) are agent-driven ConfigMap reloads, not a real fault:${NC}" | tee -a "$analysis_log"
+                echo -e "         ${last_probe}" | tee -a "$analysis_log"
+                echo -e "         The agent's inotify watcher detected a ConfigMap change and tripped the liveness probe on purpose to reload. Not flagged." | tee -a "$analysis_log"
+            elif [[ "$last_age_min" -gt 10 ]]; then
+                echo -e "  ${Cyan}[INFO] Probe failures in ${desc} (${probe_count} occurrence(s)) but the most recent one was ${last_age_min}m ago and the container is now Running Ready.${NC}" | tee -a "$analysis_log"
+                echo -e "         ${last_probe}" | tee -a "$analysis_log"
+                echo -e "         Likely stale — a ConfigMap update, rollout restart, or transient issue that already self-resolved. Not flagged." | tee -a "$analysis_log"
+            else
+                echo -e "  ${Yellow}[WARN] Liveness/Readiness probe failures detected in ${desc} (${probe_count} occurrence(s)).${NC}" | tee -a "$analysis_log"
+                echo -e "         Probe failures usually precede OOMKill events and indicate the agent (mdsd or fluent-bit)" | tee -a "$analysis_log"
+                echo -e "         is hanging or slow to respond. Common causes: high log throughput backing up the pipeline," | tee -a "$analysis_log"
+                echo -e "         under-sized memory limits, or a downstream endpoint that is intermittently unreachable." | tee -a "$analysis_log"
+                echo -e "         Last probe failure event: ${last_probe}" | tee -a "$analysis_log"
+                ANALYSIS_FINDINGS+=("Probe failures (${probe_count}) in ${desc}. Agent is hanging or slow to respond — review memory limits and downstream endpoint reachability.")
+                found_any=true
+            fi
+        fi
+
+        # ── addon-token-adapter sidecar health ────────────────────────────────
+        # The addon-token-adapter sidecar is the AKS component that brokers MSI tokens to
+        # the ama-logs container. If this sidecar isn't Ready or is crash-looping, MSI auth
+        # silently fails before mdsd even starts — and the failure won't show up in mdsd.err
+        # because mdsd never gets a token to fail with. Worth checking explicitly per pod.
+        local adapter_block
+        adapter_block=$(awk '
+            /^  addon-token-adapter:/ { capture=1; next }
+            capture && /^  [a-zA-Z]/  { exit }
+            capture                   { print }
+        ' "$desc")
+
+        if [[ -n "$adapter_block" ]]; then
+            local adapter_ready adapter_restarts adapter_state
+            adapter_ready=$(echo    "$adapter_block" | awk '/^[[:space:]]*Ready:/         {print $2; exit}')
+            adapter_restarts=$(echo "$adapter_block" | awk '/^[[:space:]]*Restart Count:/ {print $3; exit}')
+            adapter_state=$(echo    "$adapter_block" | awk '/^[[:space:]]*State:/         {print $2; exit}')
+            adapter_restarts="${adapter_restarts:-0}"
+
+            if [[ "$adapter_ready" != "True" ]] || [[ "$adapter_state" != "Running" ]]; then
+                echo -e "  ${Red}[ISSUE] addon-token-adapter sidecar is NOT healthy in ${desc}:${NC}" | tee -a "$analysis_log"
+                echo -e "          Ready=${adapter_ready:-unknown}  State=${adapter_state:-unknown}  RestartCount=${adapter_restarts}" | tee -a "$analysis_log"
+                echo -e "          This sidecar brokers MSI tokens to ama-logs. While it is down, the agent" | tee -a "$analysis_log"
+                echo -e "          cannot authenticate to AMCS/DCE regardless of network reachability." | tee -a "$analysis_log"
+                echo -e "          -> kubectl logs $(basename "${desc#*describe_}" .txt) -n kube-system -c addon-token-adapter" | tee -a "$analysis_log"
+                ANALYSIS_FINDINGS+=("addon-token-adapter sidecar unhealthy in ${desc} (Ready=${adapter_ready:-unknown}, State=${adapter_state:-unknown}). MSI auth will fail; inspect the sidecar logs.")
+                found_any=true
+            elif [[ "$adapter_restarts" -gt 3 ]]; then
+                # Same rolling-restart guard as the ama-logs container above: a graceful
+                # exit (Reason=Completed, ExitCode=0/143, or Message mentions a config
+                # change) usually means the pod was recreated by a ConfigMap update or
+                # rollout restart, not crashing.
+                local sa_reason sa_exit sa_msg
+                sa_reason=$(echo "$adapter_block" | awk '
+                    /^[[:space:]]*Last State:[[:space:]]*Terminated/ { capture=1; next }
+                    capture && /^[[:space:]]*Reason:/                { print $2; exit }
+                ')
+                sa_exit=$(echo "$adapter_block" | awk '
+                    /^[[:space:]]*Last State:[[:space:]]*Terminated/ { capture=1; next }
+                    capture && /^[[:space:]]*Exit Code:/             { print $3; exit }
+                ')
+                sa_msg=$(echo "$adapter_block" | awk '
+                    /^[[:space:]]*Last State:[[:space:]]*Terminated/ { capture=1; next }
+                    capture && /^[[:space:]]*Message:/ { sub(/^[[:space:]]*Message:[[:space:]]*/, ""); print; exit }
+                ')
+                local sa_graceful=0
+                [[ "$sa_reason" == "Completed" || "$sa_exit" == "0" || "$sa_exit" == "143" ]] && sa_graceful=1
+                echo "$sa_msg" | grep -qiE "config[[:space:]]*changed|inotifyoutput|config[[:space:]]*map[[:space:]]*updated" && sa_graceful=1
+                if [[ "$sa_graceful" -eq 1 ]]; then
+                    echo -e "  ${Cyan}[INFO] addon-token-adapter restart count ${adapter_restarts} in ${desc} but last termination was graceful (Reason=${sa_reason:-?}, ExitCode=${sa_exit:-?}). Likely a rolling restart — not flagged.${NC}" | tee -a "$analysis_log"
+                else
+                    echo -e "  ${Yellow}[WARN] addon-token-adapter has restarted ${adapter_restarts} time(s) in ${desc}.${NC}" | tee -a "$analysis_log"
+                    echo -e "         Last termination: Reason=${sa_reason:-unknown}, ExitCode=${sa_exit:-unknown}." | tee -a "$analysis_log"
+                    [[ -n "$sa_msg" ]] && echo -e "         Last State Message: ${sa_msg}" | tee -a "$analysis_log"
+                    echo -e "         Each restart drops MSI tokens in flight; bursts of 401/403s in mdsd.err around" | tee -a "$analysis_log"
+                    echo -e "         restart times are explained by this. Inspect the sidecar logs for the cause." | tee -a "$analysis_log"
+                    ANALYSIS_FINDINGS+=("addon-token-adapter has restarted ${adapter_restarts} times in ${desc} (Reason=${sa_reason:-unknown}, ExitCode=${sa_exit:-unknown}). May explain transient 401/403s in mdsd.err.")
+                    found_any=true
+                fi
+            else
+                echo -e "  ${Green}[OK] addon-token-adapter sidecar is healthy (Ready=True, restarts=${adapter_restarts}).${NC}" | tee -a "$analysis_log"
+            fi
+        fi
     done
+
+    # ── Node conditions (Disk/Memory/PID pressure) ───────────────────────────
+    local node_cond_file="cluster/node-conditions.txt"
+    if [[ -f "$node_cond_file" ]]; then
+        echo -e "\nAnalyzing node conditions for pressure events (Disk/Memory/PID)..." | tee -a "$analysis_log"
+        local pressured
+        pressured=$(grep -iE "DiskPressure|MemoryPressure|PIDPressure" "$node_cond_file" 2>/dev/null)
+        if [[ -n "$pressured" ]]; then
+            echo -e "  ${Red}[ISSUE] One or more nodes are reporting active pressure conditions:${NC}" | tee -a "$analysis_log"
+            echo "$pressured" | sed 's/^/    /' | tee -a "$analysis_log"
+            echo -e "  ${Yellow}  -> DiskPressure breaks fluent-bit checkpoints and causes container log drops on the affected node." | tee -a "$analysis_log"
+            echo -e "     MemoryPressure leads to OOMKill of the agent. PIDPressure starves the agent's worker threads." | tee -a "$analysis_log"
+            echo -e "     Free disk on the affected nodes, increase node size, or scale the node pool to relieve pressure.${NC}" | tee -a "$analysis_log"
+            ANALYSIS_FINDINGS+=("Node pressure conditions active on one or more nodes (see cluster/node-conditions.txt). DiskPressure causes fluent-bit log drops; MemoryPressure causes agent OOMKill. Investigate the affected nodes.")
+            found_any=true
+        else
+            echo -e "  ${Green}[OK] No nodes are reporting DiskPressure, MemoryPressure, or PIDPressure.${NC}" | tee -a "$analysis_log"
+        fi
+    fi
 
     # ── container-azm-ms-agentconfig ConfigMap ────────────────────────────────
     local cm_file="cluster/container-azm-ms-agentconfig.yaml"
@@ -849,30 +1327,244 @@ analyze_collected_logs() {
         echo -e "\nAnalyzing ${cm_file}..." | tee -a "$analysis_log"
         local cm_issues=0
 
-        # Collection disabled for any major data type
-        while IFS= read -r line; do
-            if echo "$line" | grep -qiE "enabled\s*=\s*false"; then
-                local section=""
-                section=$(grep -B10 "$line" "$cm_file" 2>/dev/null | grep -oP '\[log_collection_settings\.\K[^\]]+' | tail -1)
-                echo -e "  ${Yellow}[WARN] Collection disabled: ${line// /} (section: ${section:-unknown})${NC}" | tee -a "$analysis_log"
+        # Collection disabled. Several settings are FALSE by default in the upstream
+        # ConfigMap template (microsoft/Docker-Provider container-azm-ms-agentconfig.yaml).
+        # Skip the WARN when the section matches a known default-false setting so a
+        # customer who uploaded an unmodified default ConfigMap doesn't get a screenful
+        # of false positives. Surface those as INFO instead.
+        local default_disabled_re='(enrich_container_logs|collect_all_kube_events|collect_kube_system_pv_metrics|health_model|azure_network_policy_manager|azure_subnet_ip_usage|kappie_basic_metrics|multi_tenancy)'
+        # Walk the TOML-in-YAML body once with awk, tracking the active section header so
+        # each "enabled = false" line is attributed to its true section. Two YAML-shaped
+        # gotchas we have to defend against:
+        #   1. TOML comments inside the ConfigMap (lines starting with '#') are
+        #      documentation, not real settings — we must skip them, otherwise a line
+        #      like '# enabled = false' is mis-flagged as a disabled collection.
+        #   2. kubectl prints fields like 'agent-settings: "..."' as double-quoted YAML
+        #      scalars where '\n' is a literal escape inside one logical value. The YAML
+        #      printer wraps long values across lines for readability, which can leave a
+        #      commented-out '# [agent_settings.fbit_config]' looking like a real
+        #      '[agent_settings.fbit_config]' at the start of a continuation line (the
+        #      '#' is sitting at the end of the previous YAML line). We filter those out
+        #      by requiring section-header lines to end with ']' (no trailing content) —
+        #      real TOML headers in a literal-block scalar sit alone on their line.
+        while IFS=$'\t' read -r section setting_line; do
+            [[ -z "$section" && -z "$setting_line" ]] && continue
+            if [[ "$section" =~ $default_disabled_re ]]; then
+                echo -e "  ${Cyan}[INFO] '${section}' disabled — matches upstream default, not a finding.${NC}" | tee -a "$analysis_log"
+            else
+                echo -e "  ${Yellow}[WARN] Collection disabled: ${setting_line// /} (section: ${section:-unknown})${NC}" | tee -a "$analysis_log"
                 ANALYSIS_FINDINGS+=("ConfigMap: collection disabled for section '${section:-unknown}' via 'enabled = false'. Verify this is intentional.")
                 ((cm_issues++)); found_any=true
             fi
-        done < <(grep -iE "enabled\s*=\s*false" "$cm_file" 2>/dev/null)
+        done < <(awk '
+            /^[[:space:]]*\[(log_collection_settings|metric_collection_settings|agent_settings|integrations)\.[^]]+\][[:space:]]*$/ {
+                line = $0
+                sub(/^[[:space:]]*\[[^.]*\./, "", line)
+                sub(/\][[:space:]]*$/, "", line)
+                section = line
+                next
+            }
+            /^[[:space:]]*#/ { next }
+            # Skip YAML double-quoted-scalar lines — they contain literal "\n" escape
+            # sequences and embed multiple logical TOML lines into one awk record. Any
+            # "enabled = false" substring inside such a line is not a real setting we
+            # can attribute to a section.
+            /\\n/ { next }
+            # Require the disabled setting to start at line beginning (after whitespace)
+            # so we never match an "enabled = false" substring that happens to sit
+            # inside a longer text or comment payload on the same line.
+            /^[[:space:]]*(enabled|collect_basic_metrics)[[:space:]]*=[[:space:]]*false/ {
+                line = $0
+                gsub(/^[[:space:]]+/, "", line)
+                print section "\t" line
+            }
+        ' "$cm_file" 2>/dev/null)
 
-        # Namespace filtering active
+        # Namespace filtering. The upstream default ConfigMap excludes kube-system and
+        # gatekeeper-system from stdout/stderr collection. Only WARN when filtering
+        # deviates from those defaults (extra excluded namespaces, or any include_namespaces
+        # allow-list which is uncommon). Otherwise surface as INFO so the operator can see
+        # the filter is active without being told it's a problem.
         if grep -qiE "exclude_namespaces|include_namespaces" "$cm_file" 2>/dev/null; then
-            local ns_lines
-            ns_lines=$(grep -iE "exclude_namespaces|include_namespaces" "$cm_file" | head -5 | sed 's/^[[:space:]]*//')
-            echo -e "  ${Yellow}[WARN] Namespace filtering is configured in the ConfigMap:${NC}" | tee -a "$analysis_log"
-            echo "$ns_lines" | sed 's/^/    /' | tee -a "$analysis_log"
-            echo -e "         Verify this is not excluding namespaces that are expected to be collected." | tee -a "$analysis_log"
-            ANALYSIS_FINDINGS+=("ConfigMap: namespace filtering configured. Verify expected namespaces are not excluded.")
-            ((cm_issues++)); found_any=true
+            local ns_lines ns_unusual=0
+            ns_lines=$(grep -iE "exclude_namespaces|include_namespaces" "$cm_file" | head -10 | sed 's/^[[:space:]]*//')
+            echo "$ns_lines" | grep -qiE "include_namespaces" && ns_unusual=1
+            while IFS= read -r ns_line; do
+                echo "$ns_line" | grep -qiE "exclude_namespaces" || continue
+                local extras
+                extras=$(echo "$ns_line" | grep -oE '\[[^]]*\]' | tr -d '[]"' | tr ',' '\n' \
+                    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+                    | grep -viE '^(kube-system|gatekeeper-system)?$' | head -1)
+                [[ -n "$extras" ]] && ns_unusual=1
+            done <<< "$ns_lines"
+
+            if [[ "$ns_unusual" -eq 1 ]]; then
+                echo -e "  ${Yellow}[WARN] Namespace filtering deviates from upstream defaults:${NC}" | tee -a "$analysis_log"
+                echo "$ns_lines" | sed 's/^/    /' | tee -a "$analysis_log"
+                echo -e "         Verify this is not excluding namespaces that are expected to be collected." | tee -a "$analysis_log"
+                ANALYSIS_FINDINGS+=("ConfigMap: namespace filtering deviates from upstream defaults. Verify expected namespaces are not excluded.")
+                ((cm_issues++)); found_any=true
+            else
+                echo -e "  ${Cyan}[INFO] Namespace filtering matches upstream defaults (kube-system + gatekeeper-system excluded from stdout/stderr).${NC}" | tee -a "$analysis_log"
+            fi
+        fi
+
+        # Surface the active ContainerLog schema version from the ConfigMap and, if the
+        # Azure-side check ran, automatically reconcile against the DCR's enableContainerLogV2
+        # setting. A mismatch is one of the most common "no data in the table I'm querying"
+        # complaints — the agent is writing to one table, the customer is querying the other.
+        local cm_schema
+        cm_schema=$(grep -oE 'containerlog_schema_version\s*=\s*"?v[12]"?' "$cm_file" 2>/dev/null | head -1 | grep -oE 'v[12]')
+        if [[ -n "$cm_schema" ]]; then
+            if [[ -n "$DETECTED_DCR_CLV2" && "$DETECTED_DCR_CLV2" != "not set" ]]; then
+                local expected_clv2="false"
+                [[ "$cm_schema" == "v2" ]] && expected_clv2="true"
+                local dcr_schema_label
+                [[ "$DETECTED_DCR_CLV2" == "true" ]] && dcr_schema_label="v2" || dcr_schema_label="v1"
+                if [[ "$DETECTED_DCR_CLV2" == "$expected_clv2" ]]; then
+                    echo -e "  ${Green}[OK] ContainerLog schema is consistent: ConfigMap=${cm_schema}, DCR enableContainerLogV2=${DETECTED_DCR_CLV2} (${dcr_schema_label}).${NC}" | tee -a "$analysis_log"
+                else
+                    echo -e "  ${Red}[ISSUE] ContainerLog schema mismatch — agent writes to ${cm_schema}, DCR is configured for ${dcr_schema_label}.${NC}" | tee -a "$analysis_log"
+                    echo -e "          ConfigMap containerlog_schema_version:  ${cm_schema}" | tee -a "$analysis_log"
+                    echo -e "          DCR enableContainerLogV2:               ${DETECTED_DCR_CLV2} (${dcr_schema_label})" | tee -a "$analysis_log"
+                    echo -e "          Logs are written to one table but the customer is querying the other. Reconcile" | tee -a "$analysis_log"
+                    echo -e "          either the ConfigMap or the DCR so both target the same schema." | tee -a "$analysis_log"
+                    ANALYSIS_FINDINGS+=("ContainerLog schema mismatch: ConfigMap=${cm_schema}, DCR enableContainerLogV2=${DETECTED_DCR_CLV2} (${dcr_schema_label}). Reconcile to avoid querying the wrong table.")
+                    found_any=true
+                fi
+            else
+                echo -e "  ${Cyan}[INFO] ConfigMap containerlog_schema_version: ${cm_schema}${NC}" | tee -a "$analysis_log"
+                echo -e "         (Pass --cluster-resource-id to auto-compare against the DCR's enableContainerLogV2 setting." | tee -a "$analysis_log"
+                echo -e "          A mismatch sends logs to a table the customer isn't querying.)" | tee -a "$analysis_log"
+            fi
         fi
 
         if [[ "$cm_issues" -eq 0 ]]; then
             echo -e "  ${Green}[OK] No collection-disabling settings detected in ConfigMap${NC}" | tee -a "$analysis_log"
+        fi
+    fi
+
+    # ── ama-logs events ──────────────────────────────────────────────────────
+    # Scan the events file collected in other_logCollection for known bad-event patterns.
+    # Catches things the per-pod describe doesn't surface: scheduling failures (no node
+    # could host the pod), image pull failures (MCR mirror or NSG outbound block), Helm
+    # rollout warnings (managed addon stuck mid-upgrade), and mount failures (missing CM
+    # or secret). An empty file means nothing to flag — common on healthy clusters.
+    local events_file="cluster/ama-logs-events.txt"
+    if [[ -s "$events_file" ]]; then
+        echo -e "\nAnalyzing ${events_file} for scheduling, image pull, and addon rollout issues..." | tee -a "$analysis_log"
+        local event_issues=0
+
+        if grep -qiE "FailedScheduling" "$events_file"; then
+            local sched_line
+            sched_line=$(grep -iE "FailedScheduling" "$events_file" | tail -1)
+            echo -e "  ${Red}[ISSUE] FailedScheduling event present — at least one ama-logs pod cannot be scheduled.${NC}" | tee -a "$analysis_log"
+            echo -e "          ${sched_line}" | tee -a "$analysis_log"
+            echo -e "          Usually means node taints/tolerations or node selectors are mismatched, or the" | tee -a "$analysis_log"
+            echo -e "          cluster has no Linux nodes available for the DaemonSet to land on." | tee -a "$analysis_log"
+            ANALYSIS_FINDINGS+=("FailedScheduling for ama-logs pod(s). Review node taints, tolerations, and selectors. Sample event: ${sched_line}")
+            ((event_issues++)); found_any=true
+        fi
+
+        if grep -qiE "ImagePullBackOff|ErrImagePull" "$events_file"; then
+            local pull_line
+            pull_line=$(grep -iE "ImagePullBackOff|ErrImagePull" "$events_file" | tail -1)
+            echo -e "  ${Red}[ISSUE] Image pull failure — agent image cannot be pulled from MCR.${NC}" | tee -a "$analysis_log"
+            echo -e "          ${pull_line}" | tee -a "$analysis_log"
+            echo -e "          Confirm outbound HTTPS to mcr.microsoft.com is allowed, or use an MCR mirror" | tee -a "$analysis_log"
+            echo -e "          if the cluster is air-gapped." | tee -a "$analysis_log"
+            ANALYSIS_FINDINGS+=("Image pull failure for ama-logs. Confirm outbound to mcr.microsoft.com is open. Sample event: ${pull_line}")
+            ((event_issues++)); found_any=true
+        fi
+
+        if grep -qiE "FailedMount" "$events_file"; then
+            local mount_line
+            mount_line=$(grep -iE "FailedMount" "$events_file" | tail -1)
+            echo -e "  ${Red}[ISSUE] Volume mount failure on an ama-logs pod:${NC}" | tee -a "$analysis_log"
+            echo -e "          ${mount_line}" | tee -a "$analysis_log"
+            echo -e "          Usually the ama-logs-secret or container-azm-ms-agentconfig ConfigMap is missing." | tee -a "$analysis_log"
+            ANALYSIS_FINDINGS+=("FailedMount on ama-logs pod — likely missing Secret or ConfigMap. Sample event: ${mount_line}")
+            ((event_issues++)); found_any=true
+        fi
+
+        if grep -qiE "BackOff" "$events_file" && ! grep -qiE "ImagePullBackOff" "$events_file"; then
+            local backoff_line
+            backoff_line=$(grep -iE "BackOff" "$events_file" | grep -viE "ImagePullBackOff" | tail -1)
+            if [[ -n "$backoff_line" ]]; then
+                echo -e "  ${Yellow}[WARN] CrashLoopBackOff or similar BackOff event on ama-logs:${NC}" | tee -a "$analysis_log"
+                echo -e "         ${backoff_line}" | tee -a "$analysis_log"
+                echo -e "         Inspect logs_*_previous.txt for the crash reason." | tee -a "$analysis_log"
+                ANALYSIS_FINDINGS+=("BackOff event on ama-logs pod. Inspect logs_*_previous.txt for the crash reason. Sample event: ${backoff_line}")
+                ((event_issues++)); found_any=true
+            fi
+        fi
+
+        if [[ "$event_issues" -eq 0 ]]; then
+            echo -e "  ${Green}[OK] No scheduling, image pull, or mount failures found in collected events.${NC}" | tee -a "$analysis_log"
+        fi
+    fi
+
+    # ── DaemonSet desired vs ready/available ──────────────────────────────────
+    # `kubectl get daemonset` prints DESIRED CURRENT READY UP-TO-DATE AVAILABLE …
+    # When desired != ready (or != available), pods aren't landing on every node —
+    # usually node taints, scheduling failures, or image pull issues. This catches
+    # cases where SOME nodes are missing the agent (vs the per-pod describe analysis
+    # which only looks at pods that DID schedule).
+    local ds_status="cluster/daemonset-status.txt"
+    if [[ -s "$ds_status" ]]; then
+        echo -e "\nAnalyzing ${ds_status} for DaemonSet rollout coverage..." | tee -a "$analysis_log"
+        local ds_name ds_desired ds_current ds_ready ds_uptodate ds_available
+        while read -r ds_name ds_desired ds_current ds_ready ds_uptodate ds_available _; do
+            [[ -z "$ds_name" || "$ds_name" == "NAME" ]] && continue
+            [[ "$ds_desired" =~ ^[0-9]+$ ]] || continue
+            if [[ "$ds_desired" != "$ds_ready" || "$ds_desired" != "$ds_available" ]]; then
+                echo -e "  ${Red}[ISSUE] DaemonSet ${ds_name}: desired=${ds_desired}, ready=${ds_ready}, available=${ds_available}.${NC}" | tee -a "$analysis_log"
+                echo -e "          $((ds_desired - ds_ready)) pod(s) not ready, $((ds_desired - ds_available)) pod(s) not available." | tee -a "$analysis_log"
+                echo -e "          Check 'kubectl get pods -n kube-system | grep ${ds_name}' — common causes:" | tee -a "$analysis_log"
+                echo -e "          node taints without matching tolerations, FailedScheduling, image pull failures, or volume mount errors." | tee -a "$analysis_log"
+                ANALYSIS_FINDINGS+=("DaemonSet ${ds_name} not fully rolled out (desired=${ds_desired}, ready=${ds_ready}, available=${ds_available}). Some nodes have no agent.")
+                found_any=true
+            else
+                echo -e "  ${Green}[OK] DaemonSet ${ds_name}: ${ds_desired}/${ds_desired} pods desired/ready/available.${NC}" | tee -a "$analysis_log"
+            fi
+        done < "$ds_status"
+    fi
+
+    # ── ConfigMap mount sanity check (effective settings on disk) ─────────────
+    # The agent mounts container-azm-ms-agentconfig at /etc/config/settings and the
+    # entrypoint splits its contents into per-section files (one per top-level YAML
+    # key — log-data-collection-settings, agent-settings, integrations, …). If the
+    # folder is empty/missing the mount failed and the agent is running with built-in
+    # defaults regardless of what the YAML in the cluster says — a silent
+    # "my custom settings have no effect" failure mode.
+    if [[ -d "ama-logs-daemonset/settings" ]]; then
+        echo -e "\nVerifying effective agent settings under ama-logs-daemonset/settings/..." | tee -a "$analysis_log"
+        local settings_dir
+        settings_dir=$(find ama-logs-daemonset/settings -mindepth 1 -maxdepth 1 -type d -name '..*' 2>/dev/null | sort -r | head -1)
+        if [[ -z "$settings_dir" ]]; then
+            echo -e "  ${Yellow}[WARN] No effective settings data folder found under ama-logs-daemonset/settings/.${NC}" | tee -a "$analysis_log"
+            echo -e "         Either the container-azm-ms-agentconfig ConfigMap is missing, the volume mount" | tee -a "$analysis_log"
+            echo -e "         failed, or kubectl cp did not capture it. Agent is running with built-in defaults" | tee -a "$analysis_log"
+            echo -e "         in this case — any customization in the ConfigMap will not take effect." | tee -a "$analysis_log"
+            ANALYSIS_FINDINGS+=("Effective agent settings folder is empty/missing — ConfigMap mount may have failed; agent likely running with built-in defaults.")
+            found_any=true
+        else
+            local settings_count
+            settings_count=$(find "$settings_dir" -maxdepth 1 -type f 2>/dev/null | wc -l)
+            settings_count="${settings_count//[[:space:]]/}"
+            if [[ "${settings_count:-0}" -lt 3 ]]; then
+                echo -e "  ${Yellow}[WARN] Effective settings folder ${settings_dir} has only ${settings_count} file(s) — partial mount?${NC}" | tee -a "$analysis_log"
+                echo -e "         Expect at least log-data-collection-settings, agent-settings, integrations, and metric_collection_settings." | tee -a "$analysis_log"
+                ANALYSIS_FINDINGS+=("Effective agent settings folder ${settings_dir} has only ${settings_count} file(s); ConfigMap mount may be incomplete.")
+                found_any=true
+            else
+                echo -e "  ${Green}[OK] ConfigMap mount delivered ${settings_count} effective settings file(s) at ${settings_dir}.${NC}" | tee -a "$analysis_log"
+                local mounted_schema mounted_cfg
+                [[ -f "$settings_dir/schema-version" ]] && mounted_schema=$(tr -d '\r\n' < "$settings_dir/schema-version")
+                [[ -f "$settings_dir/config-version" ]] && mounted_cfg=$(tr -d '\r\n' < "$settings_dir/config-version")
+                [[ -n "$mounted_schema" || -n "$mounted_cfg" ]] && \
+                    echo -e "         Mounted schema-version=${mounted_schema:-(empty)}, config-version=${mounted_cfg:-(empty)}." | tee -a "$analysis_log"
+            fi
         fi
     fi
 
@@ -979,6 +1671,9 @@ print('|'.join([
 
         local dcr_name ws_id ws_resource_id streams interval ns_filter clv2 dce_id
         IFS='|' read -r dcr_name ws_id ws_resource_id streams interval ns_filter clv2 dce_id <<< "$fields"
+        # Python's str(bool) emits "True"/"False"; normalize to lowercase so downstream
+        # comparisons ([[ "$clv2" == "true" ]] and the cross-check) work as expected.
+        clv2=$(echo "$clv2" | tr '[:upper:]' '[:lower:]')
 
         echo -e "  ${Green}[OK] Container Insights DCR found: ${dcr_name}${NC}" | tee -a "$az_log"
         echo -e "  Destination workspace:     ${ws_id:-not found}"    | tee -a "$az_log"
@@ -992,6 +1687,9 @@ print('|'.join([
         else
             echo -e "  ContainerLogV2 enabled:    ${clv2}"             | tee -a "$az_log"
         fi
+        # Persist the DCR's ContainerLogV2 setting so the post-collection analyzer
+        # can cross-check it against the agent's ConfigMap containerlog_schema_version.
+        DETECTED_DCR_CLV2="$clv2"
         if [[ -n "$dce_id" ]]; then
             local dce_name
             dce_name=$(az monitor data-collection endpoint show --ids "$dce_id" --query "name" -o tsv 2>/dev/null)
@@ -1024,6 +1722,34 @@ print('|'.join([
             echo -e "         If logs from a specific namespace are missing, verify it is covered by this filter." | tee -a "$az_log"
             echo -e "         To review the full filter configuration: az monitor data-collection rule show --ids ${dcr_id}${NC}" | tee -a "$az_log"
             ANALYSIS_FINDINGS+=("DCR namespace filtering is set to '${ns_filter}'. Verify this is not excluding namespaces the customer expects to collect.")
+        fi
+
+        # ── DataFlows validation: every declared stream should be routed to a Log Analytics destination
+        local orphan_streams
+        orphan_streams=$(echo "$dcr_json" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+exts = d.get('dataSources',{}).get('extensions',[])
+ci = next((e for e in exts if e.get('extensionName')=='ContainerInsights'), {})
+declared = set(ci.get('streams',[]))
+la_dests = {dst.get('name') for dst in d.get('destinations',{}).get('logAnalytics',[]) if dst.get('name')}
+routed = set()
+for f in d.get('dataFlows',[]):
+    if set(f.get('destinations',[])) & la_dests:
+        routed |= set(f.get('streams',[])) & declared
+orphan = sorted(declared - routed)
+print(','.join(orphan))
+" 2>/dev/null)
+
+        if [[ -n "$orphan_streams" ]]; then
+            echo -e "  ${Red}[ISSUE] DCR has streams declared on the ContainerInsights data source that are NOT routed" | tee -a "$az_log"
+            echo -e "          to a Log Analytics destination via dataFlows: ${orphan_streams}${NC}" | tee -a "$az_log"
+            echo -e "          Data for these streams will be collected by the agent but silently dropped at the pipeline" | tee -a "$az_log"
+            echo -e "          because no dataFlow entry routes them to a workspace destination." | tee -a "$az_log"
+            echo -e "          -> Edit the DCR to add a dataFlow entry mapping each missing stream to the logAnalytics destination." | tee -a "$az_log"
+            ANALYSIS_FINDINGS+=("DCR dataFlows: streams [${orphan_streams}] are declared on the ContainerInsights data source but not routed to a Log Analytics destination. These streams will be silently dropped — add matching dataFlow entries.")
+        else
+            echo -e "  ${Green}[OK] All declared CI streams are routed to a Log Analytics destination via dataFlows.${NC}" | tee -a "$az_log"
         fi
 
         break  # Only process the first Container Insights DCR found
@@ -1271,11 +1997,13 @@ _check_workspace_network_isolation() {
             return
         fi
 
-        local scope_count found_in_scope=false scope_name_found=""
+        local scope_count found_in_scope=false scope_name_found="" scope_access_mode_found=""
+        local private_only_scopes=()
         scope_count=$(echo "$scopes_json" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null)
         echo -e "  Found ${scope_count} AMPLS scope(s) in this subscription." | tee -a "$az_log"
 
-        while IFS='|' read -r scope_name scope_rg; do
+        while IFS='|' read -r scope_name scope_rg scope_access_mode; do
+            [[ "$scope_access_mode" == "PrivateOnly" ]] && private_only_scopes+=("${scope_name} (ingestion=PrivateOnly)")
             local scoped_resources
             scoped_resources=$(az monitor private-link-scope scoped-resource list \
                 --scope-name "$scope_name" --resource-group "$scope_rg" -o json 2>/dev/null)
@@ -1287,16 +2015,19 @@ sys.exit(0 if found else 1)
 " <<< "$scoped_resources" 2>/dev/null; then
                 found_in_scope=true
                 scope_name_found="$scope_name"
+                scope_access_mode_found="$scope_access_mode"
                 break
             fi
         done < <(echo "$scopes_json" | python3 -c "
 import sys, json
 for s in json.load(sys.stdin):
-    print(s['name'] + '|' + s['resourceGroup'])
+    am = s.get('accessModeSettings') or s.get('properties',{}).get('accessModeSettings') or {}
+    mode = am.get('ingestionAccessMode','Open')
+    print(s['name'] + '|' + s['resourceGroup'] + '|' + mode)
 " 2>/dev/null)
 
         if $found_in_scope; then
-            echo -e "  ${Green}[OK] Workspace '${ws_name}' is a connected resource in AMPLS scope '${scope_name_found}'.${NC}" | tee -a "$az_log"
+            echo -e "  ${Green}[OK] Workspace '${ws_name}' is a connected resource in AMPLS scope '${scope_name_found}' (ingestion access mode: ${scope_access_mode_found:-Open}).${NC}" | tee -a "$az_log"
             echo -e "       Data from this cluster can reach the workspace through the private link." | tee -a "$az_log"
         else
             echo -e "  ${Red}[ISSUE] Workspace '${ws_name}' is NOT a connected resource in any AMPLS scope in this subscription.${NC}" | tee -a "$az_log"
@@ -1304,6 +2035,13 @@ for s in json.load(sys.stdin):
             echo -e "          Data will be dropped when it reaches the private link endpoint.${NC}" | tee -a "$az_log"
             echo -e "          -> Add '${ws_name}' as a scoped resource in the AMPLS scope covering this cluster." | tee -a "$az_log"
             ANALYSIS_FINDINGS+=("AMPLS: Workspace '${ws_name}' is not a connected resource in any AMPLS scope in this subscription. Ingestion through the private link will fail.")
+            if [[ ${#private_only_scopes[@]} -gt 0 ]]; then
+                echo -e "  ${Red}          Additionally, the following scope(s) are configured PrivateOnly for ingestion:${NC}" | tee -a "$az_log"
+                printf '            - %s\n' "${private_only_scopes[@]}" | tee -a "$az_log"
+                echo -e "  ${Red}          Public-endpoint ingestion will be REJECTED by any of these scopes regardless of" | tee -a "$az_log"
+                echo -e "          the workspace's own publicNetworkAccessForIngestion setting. This is a hard block.${NC}" | tee -a "$az_log"
+                ANALYSIS_FINDINGS+=("AMPLS: PrivateOnly ingestion scope(s) [${private_only_scopes[*]}] exist in this subscription and the workspace is not linked to any AMPLS scope. Ingestion is hard-blocked.")
+            fi
         fi
     fi
 }
@@ -1366,8 +2104,8 @@ for a in json.load(sys.stdin):
         return
     fi
 
-    local found_in_scope=false scope_name_found=""
-    while IFS='|' read -r scope_name scope_rg; do
+    local found_in_scope=false scope_name_found="" scope_access_mode_found=""
+    while IFS='|' read -r scope_name scope_rg scope_access_mode; do
         local scoped_resources
         scoped_resources=$(az monitor private-link-scope scoped-resource list \
             --scope-name "$scope_name" --resource-group "$scope_rg" -o json 2>/dev/null)
@@ -1379,16 +2117,19 @@ sys.exit(0 if found else 1)
 " <<< "$scoped_resources" 2>/dev/null; then
             found_in_scope=true
             scope_name_found="$scope_name"
+            scope_access_mode_found="$scope_access_mode"
             break
         fi
     done < <(echo "$scopes_json" | python3 -c "
 import sys, json
 for s in json.load(sys.stdin):
-    print(s['name'] + '|' + s['resourceGroup'])
+    am = s.get('accessModeSettings') or s.get('properties',{}).get('accessModeSettings') or {}
+    mode = am.get('ingestionAccessMode','Open')
+    print(s['name'] + '|' + s['resourceGroup'] + '|' + mode)
 " 2>/dev/null)
 
     if $found_in_scope; then
-        echo -e "  ${Green}[OK] DCE '${dce_name:-$dce_id}' is a connected resource in AMPLS scope '${scope_name_found}'.${NC}" | tee -a "$az_log"
+        echo -e "  ${Green}[OK] DCE '${dce_name:-$dce_id}' is a connected resource in AMPLS scope '${scope_name_found}' (ingestion access mode: ${scope_access_mode_found:-Open}).${NC}" | tee -a "$az_log"
         echo -e "       The agent can reach configuration endpoints over the private link." | tee -a "$az_log"
     else
         echo -e "  ${Red}[ISSUE] DCE '${dce_name:-$dce_id}' is NOT a connected resource in any AMPLS scope in this subscription.${NC}" | tee -a "$az_log"
@@ -1566,7 +2307,10 @@ if [[ -n "$CLUSTER_RESOURCE_ID" ]]; then
 else
     _cluster_name=$(kubectl config current-context 2>/dev/null | cut -c1-24 || true)
 fi
-output_path="CILogs.$(date +%Y%m%d).${_cluster_name:-unknown}"
+# Capture both date and HHMMSS in a single date(1) invocation so the two halves
+# can't straddle a second boundary. Format: CILogs.YYYYMMDD.HHMMSS.<cluster>
+run_ts="$(date +%Y%m%d.%H%M%S)"
+output_path="CILogs.${run_ts}.${_cluster_name:-unknown}"
 mkdir -p "$output_path"
 cd "$output_path"
 
