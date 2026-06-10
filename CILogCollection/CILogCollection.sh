@@ -956,31 +956,47 @@ analyze_collected_logs() {
         mcs_line=$(grep -m1 "MCS redirected to endpoint" "$mdsd_info" 2>/dev/null)
         gig_line=$(grep -m1 "Retrieved gig token for configuration id" "$mdsd_info" 2>/dev/null)
 
-        if [[ -n "$mcs_line" ]] && [[ -n "$gig_line" ]]; then
-            local mcs_dce dcr_id_seen
-            mcs_dce=$(echo "$mcs_line"  | grep -oE 'https://[^ ]+' | head -1)
+        # The 'gig token' line is the single, mode-independent proof that DCR config was
+        # delivered and an ingestion token was issued. The 'MCS redirected to endpoint'
+        # line only appears in AMPLS mode where AMCS hands the agent a DCE FQDN — public-
+        # network clusters never log it and that's expected, not a failure.
+        if [[ -n "$gig_line" ]]; then
+            local dcr_id_seen
             dcr_id_seen=$(echo "$gig_line" | grep -oP 'configuration id \[\K[^]]+' | head -1)
             echo -e "  ${Green}[OK] End-to-end pipeline proven via mdsd.info:${NC}" | tee -a "$analysis_log"
-            echo -e "       MCS -> DCE redirect:  ${mcs_dce:-(captured)}" | tee -a "$analysis_log"
-            echo -e "       DCR config delivered: ${dcr_id_seen:-(captured)}" | tee -a "$analysis_log"
-            echo -e "       Ingestion (gig) token successfully retrieved from the DCE." | tee -a "$analysis_log"
-        else
-            if [[ -z "$mcs_line" ]]; then
-                echo -e "  ${Red}[ISSUE] No 'MCS redirected to endpoint' line found in ${mdsd_info}.${NC}" | tee -a "$analysis_log"
-                echo -e "          The agent never reached AMCS (global.handler.control.monitor.azure.com)" | tee -a "$analysis_log"
-                echo -e "          or AMCS did not return a DCE endpoint for this cluster. Likely causes:" | tee -a "$analysis_log"
-                echo -e "            - global.handler.control.monitor.azure.com is blocked by firewall/NSG" | tee -a "$analysis_log"
-                echo -e "            - AMPLS misconfigured (DCE/workspace not connected resources)" | tee -a "$analysis_log"
-                echo -e "            - No DCR association exists on the cluster resource" | tee -a "$analysis_log"
-                ANALYSIS_FINDINGS+=("${mdsd_info}: no MCS redirect logged — the agent never reached AMCS or AMCS returned no DCE for this cluster. Review network reachability of global.handler.control.monitor.azure.com and the cluster's DCR association.")
-                found_any=true
+            if [[ -n "$mcs_line" ]]; then
+                local mcs_dce
+                mcs_dce=$(echo "$mcs_line" | grep -oE 'https://[^ ]+' | head -1)
+                echo -e "       MCS -> DCE redirect:  ${mcs_dce:-(captured)} (AMPLS path)" | tee -a "$analysis_log"
+            else
+                echo -e "       Path:                 public network (no MCS->DCE redirect — direct to AMCS)" | tee -a "$analysis_log"
             fi
-            if [[ -z "$gig_line" ]]; then
+            echo -e "       DCR config delivered: ${dcr_id_seen:-(captured)}" | tee -a "$analysis_log"
+            echo -e "       Ingestion (gig) token successfully retrieved." | tee -a "$analysis_log"
+        else
+            if [[ -n "$mcs_line" ]]; then
+                # AMPLS mode: MCS redirect happened but token retrieval failed.
                 echo -e "  ${Red}[ISSUE] No 'Retrieved gig token' line found in ${mdsd_info}.${NC}" | tee -a "$analysis_log"
                 echo -e "          MCS redirect succeeded but the agent could not get an ingestion token from" | tee -a "$analysis_log"
                 echo -e "          the DCE. This means MSI auth to the DCE is failing OR the DCE is not a" | tee -a "$analysis_log"
                 echo -e "          connected resource in the AMPLS scope. Cross-check the DCE AMPLS section." | tee -a "$analysis_log"
-                ANALYSIS_FINDINGS+=("${mdsd_info}: no gig token retrieval logged — DCE auth or DCE-AMPLS association is failing. Cross-check the DCE AMPLS section of azure-config-check.log.")
+                ANALYSIS_FINDINGS+=("${mdsd_info}: MCS redirect logged but no gig token retrieved — DCE auth or DCE-AMPLS association is failing. Cross-check the DCE AMPLS section of azure-config-check.log.")
+                found_any=true
+            else
+                # No pipeline proof at all — mode-aware remediation hints.
+                echo -e "  ${Red}[ISSUE] No 'Retrieved gig token' line found in ${mdsd_info}.${NC}" | tee -a "$analysis_log"
+                echo -e "          The agent never received DCR config or an ingestion token. Likely causes:" | tee -a "$analysis_log"
+                if $USE_AMPLS; then
+                    echo -e "            - global.handler.control.monitor.azure.com is blocked by firewall/NSG" | tee -a "$analysis_log"
+                    echo -e "            - AMPLS misconfigured (DCE/workspace not connected resources in the scope)" | tee -a "$analysis_log"
+                    echo -e "            - No DCR association exists on the cluster resource" | tee -a "$analysis_log"
+                    ANALYSIS_FINDINGS+=("${mdsd_info}: no AMCS pipeline proof — agent never reached AMCS or AMCS returned no config. Review reachability of global.handler.control.monitor.azure.com and the cluster's AMPLS/DCR association.")
+                else
+                    echo -e "            - global.handler.control.monitor.azure.com is blocked by firewall/NSG" | tee -a "$analysis_log"
+                    echo -e "            - Cluster has no DCR association (DCRA missing on the cluster resource)" | tee -a "$analysis_log"
+                    echo -e "            - Managed identity is missing the required role on the DCR" | tee -a "$analysis_log"
+                    ANALYSIS_FINDINGS+=("${mdsd_info}: no AMCS pipeline proof — agent never received DCR config. Review reachability of global.handler.control.monitor.azure.com and the cluster's DCR association.")
+                fi
                 found_any=true
             fi
         fi
@@ -1537,15 +1553,21 @@ analyze_collected_logs() {
     # folder is empty/missing the mount failed and the agent is running with built-in
     # defaults regardless of what the YAML in the cluster says — a silent
     # "my custom settings have no effect" failure mode.
-    if [[ -d "ama-logs-daemonset/settings" ]]; then
+    # Skip this entire block if the customer hasn't applied container-azm-ms-agentconfig
+    # — the agent is running with built-in defaults and the kubelet has nothing to project,
+    # so an empty settings folder is expected, not a finding.
+    if [[ ! -f "cluster/container-azm-ms-agentconfig.yaml" ]]; then
+        echo -e "\nVerifying effective agent settings under ama-logs-daemonset/settings/..." | tee -a "$analysis_log"
+        echo -e "  ${Cyan}[INFO] container-azm-ms-agentconfig ConfigMap is not present on the cluster — agent is running with built-in defaults. Mount sanity check skipped.${NC}" | tee -a "$analysis_log"
+    elif [[ -d "ama-logs-daemonset/settings" ]]; then
         echo -e "\nVerifying effective agent settings under ama-logs-daemonset/settings/..." | tee -a "$analysis_log"
         local settings_dir
         settings_dir=$(find ama-logs-daemonset/settings -mindepth 1 -maxdepth 1 -type d -name '..*' 2>/dev/null | sort -r | head -1)
         if [[ -z "$settings_dir" ]]; then
             echo -e "  ${Yellow}[WARN] No effective settings data folder found under ama-logs-daemonset/settings/.${NC}" | tee -a "$analysis_log"
-            echo -e "         Either the container-azm-ms-agentconfig ConfigMap is missing, the volume mount" | tee -a "$analysis_log"
-            echo -e "         failed, or kubectl cp did not capture it. Agent is running with built-in defaults" | tee -a "$analysis_log"
-            echo -e "         in this case — any customization in the ConfigMap will not take effect." | tee -a "$analysis_log"
+            echo -e "         The ConfigMap exists on the cluster but kubelet did not project it into the pod" | tee -a "$analysis_log"
+            echo -e "         (or kubectl cp did not capture it). Agent is running with built-in defaults in" | tee -a "$analysis_log"
+            echo -e "         this case — any customization in the ConfigMap will not take effect." | tee -a "$analysis_log"
             ANALYSIS_FINDINGS+=("Effective agent settings folder is empty/missing — ConfigMap mount may have failed; agent likely running with built-in defaults.")
             found_any=true
         else
